@@ -60,6 +60,9 @@ class LLMProvider(abc.ABC):
     """Abstract base every concrete LLM backend implements."""
 
     name: str = "abstract"
+    #: True if the engine executes attached tools server-side (e.g. vLLM
+    #: --tool-server). When False, the CLI runs tool-free for this engine.
+    supports_server_side_tools: bool = False
 
     @abc.abstractmethod
     def stream_chat(
@@ -75,21 +78,27 @@ class LLMProvider(abc.ABC):
 
 
 # --------------------------------------------------------------------------- #
-# vLLM backend (OpenAI-compatible, streaming)
+# OpenAI-compatible streaming backend (shared by vLLM and Ollama)
 # --------------------------------------------------------------------------- #
-class VLLMProvider(LLMProvider):
-    """Talks to a local vLLM server's OpenAI-compatible endpoint.
+class OpenAICompatibleProvider(LLMProvider):
+    """Streams chat completions from any OpenAI-compatible local engine.
+
+    Both vLLM and Ollama expose this API at ``http://<host>:<port>/v1``, so the
+    request/stream-parsing logic is identical; subclasses only differ in their
+    label and whether the engine executes tools server-side.
 
     Tool definitions may be passed via ``tools`` (payload formatting per the
-    deliverable). When vLLM is launched with ``--tool-server``, tools execute
-    server-side and their invocations/results appear inline in the stream.
+    deliverable). With a server-side tool engine (vLLM ``--tool-server``), tool
+    invocations/results appear inline in the stream.
     """
+
+    engine_label: str = "openai"
 
     def __init__(self, config: "AppConfig") -> None:
         self.config = config
-        self.model = config.model_selection.model
         self.settings = config.local_inference
-        self.name = f"vllm:{self.model}"
+        self.model = self.settings.model
+        self.name = f"{self.engine_label}:{self.model}"
 
     def _client(self):
         try:
@@ -100,7 +109,8 @@ class VLLMProvider(LLMProvider):
             ) from exc
         return OpenAI(
             base_url=self.settings.openai_base_url,
-            api_key=self.settings.api_key or "EMPTY",  # vLLM requires a non-empty key
+            # vLLM requires a non-empty key; Ollama ignores it. "EMPTY" satisfies both.
+            api_key=self.settings.api_key or "EMPTY",
             timeout=self.settings.request_timeout,
         )
 
@@ -124,7 +134,9 @@ class VLLMProvider(LLMProvider):
         try:
             stream = client.chat.completions.create(**kwargs)
         except Exception as exc:  # noqa: BLE001
-            yield StreamEvent(type="error", text=f"vLLM request failed: {exc}")
+            yield StreamEvent(
+                type="error", text=f"{self.engine_label} request failed: {exc}"
+            )
             yield StreamEvent(type="done", finish_reason="error")
             return
 
@@ -180,6 +192,25 @@ class VLLMProvider(LLMProvider):
         yield StreamEvent(type="done", finish_reason=finish_reason or "stop")
 
 
+class VLLMProvider(OpenAICompatibleProvider):
+    """Local vLLM engine. Executes MCP tools server-side via ``--tool-server``."""
+
+    engine_label = "vllm"
+    supports_server_side_tools = True
+
+
+class OllamaProvider(OpenAICompatibleProvider):
+    """Local Ollama daemon (OpenAI-compatible at /v1).
+
+    Ollama has no ``--tool-server`` equivalent, so the MCP tools are not executed
+    server-side; the CLI runs this engine tool-free (it still has the customer
+    portfolio analysis in its system context).
+    """
+
+    engine_label = "ollama"
+    supports_server_side_tools = False
+
+
 # --------------------------------------------------------------------------- #
 # Offline mock — deterministic, dependency-free (tests / CI / no-network demos)
 # --------------------------------------------------------------------------- #
@@ -194,6 +225,7 @@ class MockStreamingProvider(LLMProvider):
     """
 
     name = "mock:offline"
+    supports_server_side_tools = True  # simulates the full tool flow for demos/tests
 
     def stream_chat(
         self,
@@ -239,6 +271,7 @@ class MockStreamingProvider(LLMProvider):
 # --------------------------------------------------------------------------- #
 _PROVIDERS = {
     "vllm": VLLMProvider,
+    "ollama": OllamaProvider,
     "mock": MockStreamingProvider,
 }
 

@@ -26,7 +26,6 @@ from __future__ import annotations
 
 import argparse
 import sys
-from dataclasses import replace
 from typing import Dict, List, Optional, TextIO
 
 from analysis import analyze_portfolio
@@ -250,7 +249,7 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     p.add_argument("--config", default=None, help="Path to config.yaml.")
     p.add_argument("--portfolio", default=None, help="Portfolio CSV (default from config).")
     p.add_argument("--no-portfolio", action="store_true", help="Skip portfolio context.")
-    p.add_argument("--provider", choices=["vllm", "mock"], default=None,
+    p.add_argument("--provider", choices=["vllm", "ollama", "mock"], default=None,
                    help="Override model_selection.provider.")
     p.add_argument("--once", default=None, metavar="TEXT",
                    help="Run a single turn with TEXT, print the answer, and exit.")
@@ -263,16 +262,12 @@ def main(argv: Optional[List[str]] = None, out: Optional[TextIO] = None) -> int:
     args = parse_args(argv)
 
     try:
-        config = load_config(args.config)
+        # provider_override re-resolves the active engine block (host/port/model),
+        # not just the provider name.
+        config = load_config(args.config, provider_override=args.provider)
     except ConfigError as exc:
         print(f"[config error] {exc}", file=sys.stderr)
         return 2
-
-    if args.provider:
-        config = replace(
-            config,
-            model_selection=replace(config.model_selection, provider=args.provider),
-        )
 
     portfolio_path = (
         None if args.no_portfolio else (args.portfolio or config.storage_paths.default_portfolio)
@@ -285,13 +280,19 @@ def main(argv: Optional[List[str]] = None, out: Optional[TextIO] = None) -> int:
 
     provider = get_provider(config)
     memory = ConversationMemory(system_prompt)
-    tools = TOOL_SPECS
+    # Only attach MCP tools for engines that execute them server-side
+    # (vLLM --tool-server). Ollama has no equivalent, so it runs tool-free.
+    tools = TOOL_SPECS if provider.supports_server_side_tools else None
+    if tools:
+        tools_line = ", ".join(t["function"]["name"] for t in tools)
+    else:
+        tools_line = "disabled for this engine (no server-side --tool-server)"
     use_color = (not args.no_color) and hasattr(out, "isatty") and out.isatty()
 
     out.write(
         f"=== Financial Advisor AI Agent (READ-ONLY) ===\n"
         f"Backend : {provider.describe()}\n"
-        f"Tools   : {', '.join(t['function']['name'] for t in tools)}\n"
+        f"Tools   : {tools_line}\n"
         f"Portfolio context: {'loaded' if portfolio_path else 'disabled'}\n"
         f"Type /help for commands, /exit to quit.\n"
     )

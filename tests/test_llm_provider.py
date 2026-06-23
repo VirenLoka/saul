@@ -6,14 +6,18 @@ shaping, and the deterministic MockStreamingProvider event stream.
 
 from __future__ import annotations
 
+import os
+import tempfile
 from dataclasses import replace
 
 import pytest
+import yaml
 
 from config_loader import load_config
 from llm_provider import (
     LLMProviderError,
     MockStreamingProvider,
+    OllamaProvider,
     StreamEvent,
     VLLMProvider,
     get_provider,
@@ -21,7 +25,17 @@ from llm_provider import (
 
 
 def _with_provider(cfg, provider):
-    return replace(cfg, model_selection=replace(cfg.model_selection, provider=provider))
+    """Re-load the config with a different provider so the active engine block
+    (host/port/model) is re-resolved, not just the provider name."""
+    raw = dict(cfg.raw)
+    raw["model_selection"] = {**raw.get("model_selection", {}), "provider": provider}
+    fd, path = tempfile.mkstemp(suffix=".yaml")
+    with os.fdopen(fd, "w") as fh:
+        yaml.safe_dump(raw, fh)
+    try:
+        return load_config(path)
+    finally:
+        os.unlink(path)
 
 
 def test_factory_returns_vllm_by_default():
@@ -30,11 +44,24 @@ def test_factory_returns_vllm_by_default():
     assert isinstance(provider, VLLMProvider)
     assert provider.model == "Qwen/Qwen2.5-7B-Instruct"
     assert "vllm" in provider.describe()
+    assert provider.supports_server_side_tools is True
+
+
+def test_factory_returns_ollama_when_selected():
+    cfg = _with_provider(load_config(), "ollama")
+    provider = get_provider(cfg)
+    assert isinstance(provider, OllamaProvider)
+    assert provider.model == "qwen2.5:7b-instruct"
+    assert "ollama" in provider.describe()
+    # Ollama has no --tool-server, so the CLI runs it tool-free.
+    assert provider.supports_server_side_tools is False
 
 
 def test_factory_returns_mock_when_selected():
     cfg = _with_provider(load_config(), "mock")
-    assert isinstance(get_provider(cfg), MockStreamingProvider)
+    provider = get_provider(cfg)
+    assert isinstance(provider, MockStreamingProvider)
+    assert provider.supports_server_side_tools is True
 
 
 def test_unknown_provider_raises():

@@ -86,7 +86,27 @@ saul/
     └── test_cli.py             # full loop via mock provider — no forward pass
 ```
 
-## Execution — bring the whole stack up
+## Choosing an engine: vLLM or Ollama
+
+Switch the local engine with one config value — `model_selection.provider`
+(`vllm` | `ollama` | `mock`) — and launch the matching engine via
+`SPARKS_ENGINE` in `serve.sh`. Both speak the OpenAI-compatible chat API, so the
+client code is identical. The one difference:
+
+| | vLLM | Ollama |
+|---|------|--------|
+| Endpoint | `http://127.0.0.1:8000/v1` | `http://127.0.0.1:11434/v1` |
+| Model id | `Qwen/Qwen2.5-7B-Instruct` (HF) | `qwen2.5:7b-instruct` (tag) |
+| API key | `SPARKS_API_KEY` (required) | `OLLAMA_API_KEY` (usually unused) |
+| **MCP tools** | **server-side via `--tool-server`** | **none** — runs tool-free |
+
+> Ollama has no `--tool-server`, so the live MCP market-data tools are not
+> executed server-side in Ollama mode. The CLI detects this (via the provider's
+> `supports_server_side_tools` flag), runs the engine tool-free, and still feeds
+> it the customer portfolio analysis in the system context. Use vLLM for the
+> full live-tool experience.
+
+## Execution — vLLM (full MCP tools)
 
 Three terminals. The MCP server must start **before** vLLM so `--tool-server`
 can connect.
@@ -104,15 +124,18 @@ export SPARKS_API_KEY="$(openssl rand -hex 32)"
 python mcp_server.py
 
 # --- Terminal 2: vLLM engine with the MCP server attached --------------------
-bash serve.sh
-#   equivalently:
-#   vllm serve Qwen/Qwen2.5-7B-Instruct --host 127.0.0.1 --port 8000 \
-#     --enable-auto-tool-choice --tool-call-parser hermes \
-#     --tool-server http://127.0.0.1:8001/sse \
-#     --api-key "$SPARKS_API_KEY"
+SPARKS_ENGINE=vllm bash serve.sh
 
 # --- Terminal 3: the interactive agent ---------------------------------------
-python cli.py
+python cli.py                       # config: model_selection.provider: vllm
+```
+
+## Execution — Ollama (no GPU / no MCP tools)
+
+```bash
+# config.yaml: set model_selection.provider: ollama   (or pass --provider ollama)
+SPARKS_ENGINE=ollama bash serve.sh  # pulls qwen2.5:7b-instruct, starts the daemon
+python cli.py --provider ollama
 ```
 
 Example session:
@@ -145,20 +168,22 @@ The suite uses the mock provider and mocked market data — no model inference a
 no live network:
 
 ```bash
-python3 -m pytest -q          # 37 tests
+python3 -m pytest -q          # 40 tests
 python3 -m pytest tests/test_market_data.py -q     # market tool logic only
 python3 -m pytest tests/test_cli.py -q             # interactive loop + memory
 ```
 
 ## Configuration & secrets
 
-* `model_selection.provider`: `vllm` (default) or `mock`.
-* vLLM connection: `local_inference_settings.{host,port,api_key,...}`.
+* `model_selection.provider`: `vllm` (default), `ollama`, or `mock`.
+* Engine connection: `local_inference_settings.{vllm,ollama}.{model,host,port,api_key}`
+  plus shared `{temperature,max_tokens,request_timeout,stream}`. The loader
+  resolves the block matching the active provider.
 * MCP: `mcp.{host,port,transport,tool_server_url}` and
   `mcp.market_data.{default_exchange,use_live,cache_ttl_seconds}`.
-* Secrets are read from env first — `SPARKS_API_KEY` (vLLM), `OPENAI_API_KEY` /
-  `OPENAI_BASE_URL` (optional external), `NEWSAPI_KEY` (future). Never commit
-  real keys; the YAML holds empty placeholders.
+* Secrets are read from env first — `SPARKS_API_KEY` (vLLM), `OLLAMA_API_KEY`
+  (Ollama), `OPENAI_API_KEY` / `OPENAI_BASE_URL` (optional external),
+  `NEWSAPI_KEY` (future). Never commit real keys; the YAML holds placeholders.
 
 ## Future integration points
 

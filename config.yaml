@@ -8,30 +8,45 @@
 
 # -----------------------------------------------------------------------------
 # model_selection
-#   provider: which LLM backend the CLI talks to.
-#     - vllm  -> OpenAI-compatible requests to a local vLLM server (default)
-#     - mock  -> deterministic offline stub (no network; used for tests/CI)
-#   model: the served model identifier (must match vLLM --served-model-name).
+#   provider: which local LLM engine the CLI talks to. Both vllm and ollama
+#   speak the OpenAI-compatible chat API, so switching is just this one value
+#   (plus launching the matching engine via serve.sh).
+#     - vllm    -> local vLLM server; supports server-side MCP tools (--tool-server)
+#     - ollama  -> local Ollama daemon; OpenAI-compatible at /v1. NOTE: Ollama has
+#                  no --tool-server, so the MCP tools are NOT executed server-side
+#                  in this mode (the CLI runs tool-free for this engine).
+#     - mock    -> deterministic offline stub (no network; used for tests/CI)
 # -----------------------------------------------------------------------------
 model_selection:
-  provider: vllm
-  model: "Qwen/Qwen2.5-7B-Instruct"
+  provider: vllm         # vllm | ollama | mock
 
 # -----------------------------------------------------------------------------
 # local_inference_settings
-#   Connection + sampling knobs for the local vLLM server. The server exposes an
-#   OpenAI-compatible endpoint at http://<host>:<port>/v1 and is protected by a
-#   bearer token (api_key). The loader prefers env SPARKS_API_KEY over the file
-#   value so real secrets never need to be committed.
+#   Shared sampling/streaming knobs plus a per-engine connection block. The
+#   loader reads the block matching model_selection.provider and exposes it as
+#   the active engine. Each engine exposes an OpenAI-compatible endpoint at
+#   http://<host>:<port>/v1. API keys are read from the environment first:
+#     - vLLM   -> SPARKS_API_KEY  (bearer token; required by serve.sh)
+#     - Ollama -> OLLAMA_API_KEY  (usually unused; Ollama accepts any token)
 # -----------------------------------------------------------------------------
 local_inference_settings:
-  host: "127.0.0.1"      # matches SPARKS_HOST in serve.sh
-  port: 8000             # matches SPARKS_PORT in serve.sh
-  api_key: ""            # or set env SPARKS_API_KEY (preferred)
+  # Shared across whichever engine is active:
   temperature: 0.2
   max_tokens: 1024
   request_timeout: 180
   stream: true           # stream tokens so the CLI can show live reasoning/tools
+
+  vllm:
+    model: "Qwen/Qwen2.5-7B-Instruct"   # HF repo id / vLLM --served-model-name
+    host: "127.0.0.1"                    # matches SPARKS_HOST in serve.sh
+    port: 8000                           # matches SPARKS_PORT in serve.sh
+    api_key: ""                          # or env SPARKS_API_KEY (preferred)
+
+  ollama:
+    model: "qwen2.5:7b-instruct"         # Ollama model tag (lowercase, not HF id)
+    host: "127.0.0.1"
+    port: 11434                          # default Ollama port
+    api_key: ""                          # usually unused; or env OLLAMA_API_KEY
 
 # -----------------------------------------------------------------------------
 # mcp

@@ -37,12 +37,19 @@ class ConfigError(RuntimeError):
 # --------------------------------------------------------------------------- #
 @dataclass(frozen=True)
 class ModelSelection:
-    provider: str   # "vllm" | "mock"
-    model: str
+    provider: str   # "vllm" | "ollama" | "mock"
 
 
 @dataclass(frozen=True)
 class LocalInferenceSettings:
+    """Resolved connection + sampling settings for the ACTIVE engine.
+
+    ``engine`` records which backend these belong to (vllm/ollama); ``model``,
+    ``host``, ``port``, and ``api_key`` come from that engine's config block.
+    """
+
+    engine: str
+    model: str
     host: str
     port: int
     api_key: str
@@ -53,7 +60,7 @@ class LocalInferenceSettings:
 
     @property
     def base_url(self) -> str:
-        """OpenAI-compatible base URL of the vLLM server (without /v1)."""
+        """OpenAI-compatible base URL of the engine (without /v1)."""
         return f"http://{self.host}:{self.port}"
 
     @property
@@ -129,8 +136,17 @@ def _require(section: Dict[str, Any], key: str, where: str) -> Any:
     return section[key]
 
 
-def load_config(path: Optional[os.PathLike | str] = None) -> AppConfig:
-    """Load, validate, and return the application configuration."""
+def load_config(
+    path: Optional[os.PathLike | str] = None,
+    *,
+    provider_override: Optional[str] = None,
+) -> AppConfig:
+    """Load, validate, and return the application configuration.
+
+    ``provider_override`` (e.g. from a ``--provider`` CLI flag) replaces
+    ``model_selection.provider`` before the active engine block is resolved, so
+    the connection settings track the chosen engine.
+    """
     config_path = Path(path) if path else DEFAULT_CONFIG_PATH
     if not config_path.exists():
         raise ConfigError(f"Config file not found: {config_path}")
@@ -143,24 +159,35 @@ def load_config(path: Optional[os.PathLike | str] = None) -> AppConfig:
 
     # ---- model_selection ---------------------------------------------------
     ms = _get_section(data, "model_selection")
-    provider = str(_require(ms, "provider", "model_selection")).lower()
-    valid_providers = {"vllm", "mock"}
+    provider = str(provider_override or _require(ms, "provider", "model_selection")).lower()
+    valid_providers = {"vllm", "ollama", "mock"}
     if provider not in valid_providers:
         raise ConfigError(
             f"model_selection.provider '{provider}' is invalid; "
             f"expected one of {sorted(valid_providers)}."
         )
-    model_selection = ModelSelection(
-        provider=provider,
-        model=str(_require(ms, "model", "model_selection")),
-    )
+    model_selection = ModelSelection(provider=provider)
 
     # ---- local_inference_settings ------------------------------------------
+    # Resolve the connection block for the active engine. 'mock' needs no live
+    # engine, so it harmlessly borrows the vllm block's defaults.
     li = _get_section(data, "local_inference_settings")
+    engine = provider if provider in {"vllm", "ollama"} else "vllm"
+    block = li.get(engine, {}) or {}
+
+    _ENGINE_DEFAULTS = {
+        "vllm": ("Qwen/Qwen2.5-7B-Instruct", 8000, "SPARKS_API_KEY"),
+        "ollama": ("qwen2.5:7b-instruct", 11434, "OLLAMA_API_KEY"),
+    }
+    default_model, default_port, env_key = _ENGINE_DEFAULTS[engine]
+    api_key = os.environ.get(env_key, "") or str(block.get("api_key", ""))
+
     local_inference = LocalInferenceSettings(
-        host=str(li.get("host", "127.0.0.1")),
-        port=int(li.get("port", 8000)),
-        api_key=os.environ.get("SPARKS_API_KEY", "") or str(li.get("api_key", "")),
+        engine=engine,
+        model=str(block.get("model", default_model)),
+        host=str(block.get("host", "127.0.0.1")),
+        port=int(block.get("port", default_port)),
+        api_key=api_key,
         temperature=float(li.get("temperature", 0.2)),
         max_tokens=int(li.get("max_tokens", 1024)),
         request_timeout=int(li.get("request_timeout", 180)),
@@ -229,8 +256,9 @@ def load_config(path: Optional[os.PathLike | str] = None) -> AppConfig:
 if __name__ == "__main__":  # pragma: no cover - manual sanity check
     cfg = load_config()
     print("Provider       :", cfg.model_selection.provider)
-    print("Model          :", cfg.model_selection.model)
-    print("vLLM URL       :", cfg.local_inference.openai_base_url)
+    print("Engine         :", cfg.local_inference.engine)
+    print("Model          :", cfg.local_inference.model)
+    print("Engine URL     :", cfg.local_inference.openai_base_url)
     print("API key set    :", bool(cfg.local_inference.api_key))
     print("MCP tool server:", cfg.mcp.tool_server_url)
     print("Market live     :", cfg.mcp.market_data.use_live)
