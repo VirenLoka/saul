@@ -1,37 +1,56 @@
 """LLM provider abstraction layer.
 
-This module decouples the rest of the application from any specific inference
-backend. Everything downstream depends only on the :class:`LLMProvider`
-interface; the concrete backend is selected at runtime from config.
+Decouples the CLI from the inference backend. Everything downstream depends only
+on :class:`LLMProvider` and the normalized :class:`StreamEvent` stream; the
+concrete backend (vLLM over an OpenAI-compatible API, or an offline mock) is
+selected at runtime from config.
 
-Local backend
--------------
-The sole local runner is **vLLM**, launched via ``serve.sh``. It exposes an
-OpenAI-compatible ``/v1/chat/completions`` endpoint on
-``http://<host>:<port>`` and is protected by a bearer token
-(``SPARKS_API_KEY`` env var / ``local_inference_settings.api_key`` in config).
+Streaming contract
+------------------
+``stream_chat(messages, tools)`` yields :class:`StreamEvent` objects in arrival
+order. Event types:
 
-Design goals
-------------
-* One narrow interface: ``generate(system_prompt, user_prompt) -> str``.
-* Backends are constructed by a single :func:`get_provider` factory driven by
-  ``AppConfig``, so swapping models never touches call sites.
-* Heavy / optional dependencies (``requests``, ``openai``, ``anthropic``)
-  are imported lazily *inside* each provider, so importing this module —
-  and running the unit/smoke tests — needs none of them.
+  * ``reasoning``   — a chunk of the model's thinking (vLLM ``reasoning_content``
+                      extension; may be absent on non-reasoning models).
+  * ``tool_call``   — the model/engine is invoking an MCP tool. ``name`` /
+                      ``arguments`` are populated. With vLLM ``--tool-server``
+                      the tool runs server-side; this event lets the CLI
+                      announce it.
+  * ``tool_result`` — a tool's result surfaced back in the stream (when the
+                      engine reports it).
+  * ``content``     — a chunk of the final user-facing answer.
+  * ``error``       — a recoverable error message.
+  * ``done``        — terminal event; ``finish_reason`` set.
+
+The ``openai`` SDK is imported lazily inside the vLLM provider, so importing
+this module (and running the unit/smoke tests via the mock) needs no network and
+no extra packages.
 """
 
 from __future__ import annotations
 
 import abc
-from typing import TYPE_CHECKING
+import json
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Dict, Iterator, List, Optional
 
-if TYPE_CHECKING:  # avoid a hard import cycle / runtime dependency
+if TYPE_CHECKING:  # avoid a hard runtime dependency / import cycle
     from config_loader import AppConfig
 
 
 class LLMProviderError(RuntimeError):
     """Raised when a provider is misconfigured or a backend call fails."""
+
+
+@dataclass
+class StreamEvent:
+    """One normalized event in a streamed model turn."""
+
+    type: str  # reasoning | tool_call | tool_result | content | error | done
+    text: str = ""
+    name: str = ""                       # tool name (tool_call / tool_result)
+    arguments: str = ""                  # raw JSON args (tool_call)
+    finish_reason: Optional[str] = None  # set on `done`
 
 
 # --------------------------------------------------------------------------- #
@@ -40,189 +59,198 @@ class LLMProviderError(RuntimeError):
 class LLMProvider(abc.ABC):
     """Abstract base every concrete LLM backend implements."""
 
-    #: Human-readable name, set by subclasses for logging/reporting.
     name: str = "abstract"
 
     @abc.abstractmethod
-    def generate(self, system_prompt: str, user_prompt: str) -> str:
-        """Return the model's completion for the given prompts."""
+    def stream_chat(
+        self,
+        messages: List[Dict[str, object]],
+        tools: Optional[List[Dict[str, object]]] = None,
+    ) -> Iterator[StreamEvent]:
+        """Yield normalized stream events for one assistant turn."""
         raise NotImplementedError
 
     def describe(self) -> str:
-        """Short, log-friendly description of the active backend."""
         return self.name
 
 
 # --------------------------------------------------------------------------- #
-# Local backend: Qwen/Qwen2.5-7B-Instruct served by vLLM
+# vLLM backend (OpenAI-compatible, streaming)
 # --------------------------------------------------------------------------- #
-class LocalQwenProvider(LLMProvider):
-    """Calls the local vLLM server (launched via serve.sh).
+class VLLMProvider(LLMProvider):
+    """Talks to a local vLLM server's OpenAI-compatible endpoint.
 
-    The server exposes an OpenAI-compatible ``/v1/chat/completions`` endpoint.
-    If ``local_inference_settings.api_key`` is set (or ``SPARKS_API_KEY`` env
-    var is present), every request carries ``Authorization: Bearer <key>``.
+    Tool definitions may be passed via ``tools`` (payload formatting per the
+    deliverable). When vLLM is launched with ``--tool-server``, tools execute
+    server-side and their invocations/results appear inline in the stream.
     """
 
     def __init__(self, config: "AppConfig") -> None:
         self.config = config
-        self.model_id = config.model_selection.local_model
+        self.model = config.model_selection.model
         self.settings = config.local_inference
-        self.name = f"local:vllm:{self.model_id}"
+        self.name = f"vllm:{self.model}"
 
-    def generate(self, system_prompt: str, user_prompt: str) -> str:
-        import requests  # lazy import
-
-        url = f"{self.settings.base_url}/v1/chat/completions"
-        headers = {"Content-Type": "application/json"}
-        if self.settings.api_key:
-            headers["Authorization"] = f"Bearer {self.settings.api_key}"
-
-        payload = {
-            "model": self.model_id,
-            "temperature": self.settings.temperature,
-            "max_tokens": self.settings.max_tokens,
-            "messages": [
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt},
-            ],
-        }
-        try:
-            resp = requests.post(
-                url,
-                json=payload,
-                headers=headers,
-                timeout=self.settings.request_timeout,
-            )
-            resp.raise_for_status()
-            data = resp.json()
-        except Exception as exc:  # noqa: BLE001
-            raise LLMProviderError(
-                f"vLLM request to {url} failed: {exc}"
-            ) from exc
-        return data["choices"][0]["message"]["content"].strip()
-
-
-# --------------------------------------------------------------------------- #
-# External API fallbacks
-# --------------------------------------------------------------------------- #
-class OpenAIProvider(LLMProvider):
-    """OpenAI Chat Completions backend (fallback)."""
-
-    def __init__(self, config: "AppConfig") -> None:
-        self.config = config
-        self.model = config.model_selection.openai_model
-        self.api_key = config.api_credentials.openai_api_key
-        self.base_url = config.api_credentials.openai_base_url or None
-        self.name = f"openai:{self.model}"
-        if not self.api_key:
-            raise LLMProviderError(
-                "OpenAI selected but no API key found. "
-                "Set OPENAI_API_KEY or api_credentials.openai.api_key."
-            )
-
-    def generate(self, system_prompt: str, user_prompt: str) -> str:
+    def _client(self):
         try:
             from openai import OpenAI  # lazy import
         except Exception as exc:  # noqa: BLE001
             raise LLMProviderError(
                 "openai package not installed. Install with: pip install openai"
             ) from exc
-
-        client = OpenAI(api_key=self.api_key, base_url=self.base_url)
-        resp = client.chat.completions.create(
-            model=self.model,
-            temperature=self.config.local_inference.temperature,
-            max_tokens=self.config.local_inference.max_tokens,
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt},
-            ],
+        return OpenAI(
+            base_url=self.settings.openai_base_url,
+            api_key=self.settings.api_key or "EMPTY",  # vLLM requires a non-empty key
+            timeout=self.settings.request_timeout,
         )
-        return (resp.choices[0].message.content or "").strip()
 
+    def stream_chat(
+        self,
+        messages: List[Dict[str, object]],
+        tools: Optional[List[Dict[str, object]]] = None,
+    ) -> Iterator[StreamEvent]:
+        client = self._client()
+        kwargs: Dict[str, object] = {
+            "model": self.model,
+            "messages": messages,
+            "temperature": self.settings.temperature,
+            "max_tokens": self.settings.max_tokens,
+            "stream": True,
+        }
+        if tools:
+            kwargs["tools"] = tools
+            kwargs["tool_choice"] = "auto"
 
-class AnthropicProvider(LLMProvider):
-    """Anthropic Messages API backend (fallback)."""
-
-    def __init__(self, config: "AppConfig") -> None:
-        self.config = config
-        self.model = config.model_selection.anthropic_model
-        self.api_key = config.api_credentials.anthropic_api_key
-        self.name = f"anthropic:{self.model}"
-        if not self.api_key:
-            raise LLMProviderError(
-                "Anthropic selected but no API key found. "
-                "Set ANTHROPIC_API_KEY or api_credentials.anthropic.api_key."
-            )
-
-    def generate(self, system_prompt: str, user_prompt: str) -> str:
         try:
-            import anthropic  # lazy import
+            stream = client.chat.completions.create(**kwargs)
         except Exception as exc:  # noqa: BLE001
-            raise LLMProviderError(
-                "anthropic package not installed. "
-                "Install with: pip install anthropic"
-            ) from exc
+            yield StreamEvent(type="error", text=f"vLLM request failed: {exc}")
+            yield StreamEvent(type="done", finish_reason="error")
+            return
 
-        client = anthropic.Anthropic(api_key=self.api_key)
-        resp = client.messages.create(
-            model=self.model,
-            max_tokens=self.config.local_inference.max_tokens,
-            temperature=self.config.local_inference.temperature,
-            system=system_prompt,
-            messages=[{"role": "user", "content": user_prompt}],
-        )
-        # Concatenate any text blocks in the response.
-        parts = [b.text for b in resp.content if getattr(b, "type", "") == "text"]
-        return "".join(parts).strip()
+        # Accumulate tool-call fragments by index, then flush each as ONE
+        # complete tool_call event before the first content token (tool deltas
+        # always precede content in vLLM's stream). This keeps the event
+        # contract identical to the mock provider: one tool_call per tool, with
+        # full arguments, emitted before the answer.
+        acc: Dict[int, Dict[str, str]] = {}
+        tools_flushed = False
+        finish_reason: Optional[str] = None
+
+        def _flush_tools() -> Iterator[StreamEvent]:
+            for idx in sorted(acc):
+                slot = acc[idx]
+                if slot["name"]:
+                    yield StreamEvent(
+                        type="tool_call",
+                        name=slot["name"],
+                        arguments=slot["arguments"],
+                    )
+
+        for chunk in stream:
+            if not chunk.choices:
+                continue
+            choice = chunk.choices[0]
+            delta = choice.delta
+            finish_reason = choice.finish_reason or finish_reason
+
+            reasoning = getattr(delta, "reasoning_content", None)
+            if reasoning:
+                yield StreamEvent(type="reasoning", text=reasoning)
+
+            for tc in getattr(delta, "tool_calls", None) or []:
+                idx = getattr(tc, "index", 0) or 0
+                slot = acc.setdefault(idx, {"name": "", "arguments": ""})
+                fn = getattr(tc, "function", None)
+                if fn is not None:
+                    if getattr(fn, "name", None):
+                        slot["name"] += fn.name
+                    if getattr(fn, "arguments", None):
+                        slot["arguments"] += fn.arguments
+
+            if getattr(delta, "content", None):
+                if acc and not tools_flushed:
+                    yield from _flush_tools()
+                    tools_flushed = True
+                yield StreamEvent(type="content", text=delta.content)
+
+        if acc and not tools_flushed:
+            yield from _flush_tools()
+
+        yield StreamEvent(type="done", finish_reason=finish_reason or "stop")
 
 
 # --------------------------------------------------------------------------- #
-# Offline stub — used for tests / CI / no-network demos
+# Offline mock — deterministic, dependency-free (tests / CI / no-network demos)
 # --------------------------------------------------------------------------- #
-class MockProvider(LLMProvider):
-    """Deterministic, dependency-free provider.
+class MockStreamingProvider(LLMProvider):
+    """Deterministic provider that performs NO model forward pass.
 
-    Performs **no** model forward pass. It echoes a fixed, clearly-labelled
-    template so that the end-to-end pipeline (config -> ingest -> analyze ->
-    report) can be exercised on machines that cannot run the real model.
+    It emits a fixed, clearly-labelled event sequence — reasoning, a tool call,
+    a tool result, then a final answer — so the entire CLI pipeline (memory,
+    reasoning display, tool-invocation logging, final render) can be exercised
+    offline. If the latest user message mentions a sector it "calls" the sector
+    tool; otherwise the single-quote tool.
     """
 
     name = "mock:offline"
 
-    def generate(self, system_prompt: str, user_prompt: str) -> str:
-        return (
-            "[MOCK LLM OUTPUT — no model was run]\n"
-            "This is a deterministic stub used for offline testing. "
-            "Configure model_selection.provider in config.yaml to use a real "
-            "model (local Qwen or an API fallback).\n"
-            f"(system prompt chars={len(system_prompt)}, "
-            f"user prompt chars={len(user_prompt)})"
+    def stream_chat(
+        self,
+        messages: List[Dict[str, object]],
+        tools: Optional[List[Dict[str, object]]] = None,
+    ) -> Iterator[StreamEvent]:
+        last_user = ""
+        for m in reversed(messages):
+            if m.get("role") == "user":
+                last_user = str(m.get("content", ""))
+                break
+        text = last_user.lower()
+
+        if "sector" in text or any(s in text for s in ("it sector", "banking", "auto")):
+            tool_name = "get_indian_sector_performance"
+            args = json.dumps({"sector": "IT"})
+        else:
+            tool_name = "get_indian_stock_quote"
+            args = json.dumps({"query": "Reliance", "exchange": "NS"})
+
+        yield StreamEvent(
+            type="reasoning",
+            text="[MOCK] No model was run. Deciding which MCP tool answers this.",
         )
+        yield StreamEvent(type="tool_call", name=tool_name, arguments=args)
+        yield StreamEvent(
+            type="tool_result",
+            name=tool_name,
+            text='{"source": "mock", "note": "deterministic offline result"}',
+        )
+        for token in (
+            "[MOCK LLM OUTPUT] ",
+            "Based on the (mock) tool data, ",
+            "this is a deterministic offline answer. ",
+            "Not financial advice; no trades executed.",
+        ):
+            yield StreamEvent(type="content", text=token)
+        yield StreamEvent(type="done", finish_reason="stop")
 
 
 # --------------------------------------------------------------------------- #
 # Factory
 # --------------------------------------------------------------------------- #
 _PROVIDERS = {
-    "local": LocalQwenProvider,
-    "openai": OpenAIProvider,
-    "anthropic": AnthropicProvider,
-    "mock": MockProvider,
+    "vllm": VLLMProvider,
+    "mock": MockStreamingProvider,
 }
 
 
 def get_provider(config: "AppConfig") -> LLMProvider:
     """Construct the provider selected by ``model_selection.provider``."""
-    provider_key = config.model_selection.provider
-    cls = _PROVIDERS.get(provider_key)
+    key = config.model_selection.provider
+    cls = _PROVIDERS.get(key)
     if cls is None:
         raise LLMProviderError(
-            f"Unsupported provider '{provider_key}'. "
-            f"Choose one of: {sorted(_PROVIDERS)}."
+            f"Unsupported provider '{key}'. Choose one of: {sorted(_PROVIDERS)}."
         )
-    # MockProvider takes no config; the rest are config-driven.
-    if cls is MockProvider:
-        return MockProvider()
+    if cls is MockStreamingProvider:
+        return MockStreamingProvider()
     return cls(config)

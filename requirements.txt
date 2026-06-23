@@ -1,15 +1,15 @@
-# Core (required to run the MVP)
+# --- Core (required to run the CLI client) -----------------------------------
 PyYAML>=6.0
+openai>=1.30          # OpenAI-compatible client for the vLLM endpoint
 
-# --- Optional backends (install only what you use) ---------------------------
-# Local runners (ollama / vllm use a plain HTTP call):
-requests>=2.31         # needed for runner: ollama or vllm
-# In-process Hugging Face inference (runner: transformers) — heavy:
-# transformers[torch]>=4.44
+# --- MCP tool server ---------------------------------------------------------
+fastmcp>=2.0          # standalone Indian market-data MCP server (mcp_server.py)
 
-# External API fallbacks:
-# openai>=1.30          # provider: openai
-# anthropic>=0.39       # provider: anthropic
+# --- Market data -------------------------------------------------------------
+yfinance>=0.2.40      # live Indian quotes (.NS/.BO); mock fallback if absent
 
-# --- Dev / test ---------------------------------------------------------------
+# --- Local inference engine (serving host only; not needed by the CLI) -------
+# vllm>=0.6.0          # launched via serve.sh with --tool-server
+
+# --- Dev / test --------------------------------------------------------------
 pytest>=8.0

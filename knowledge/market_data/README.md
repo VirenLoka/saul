@@ -21,18 +21,19 @@ already in place:
    `scrape_to_markdown(url) -> Path`. Write outputs under
    `config.storage_paths.market_data`.
 2. Add a loader that reads the drop zone into typed objects (mirroring how
-   `data_ingestion.load_portfolio` works for CSVs).
-3. Optionally embed these documents into `knowledge/vector_db/` for retrieval,
-   then surface the most relevant snippets in the prompt.
+   `portfolio_parser.load_portfolio` works for CSVs).
+3. Expose the news/research as additional MCP tools in `mcp_server.py`
+   (e.g. `get_recent_news(ticker)`), so the agent fetches them the same way it
+   already fetches live quotes — and/or embed them into `knowledge/vector_db/`.
 
-Real-time API keys (e.g. NewsAPI) follow the same secret hygiene as the LLM
-providers: supply them via environment variables, never commit them.
+The NewsAPI key already has a placeholder (`api_credentials.newsapi_key` / env
+`NEWSAPI_KEY`); follow the same secret hygiene as the vLLM key — never commit it.
 
-## Suggested config block (add when implementing)
+## Suggested config block (extend `mcp.market_data` when implementing)
 
 ```yaml
-market_data:
-  newsapi_key: ""            # or env NEWSAPI_KEY
-  refresh_interval_minutes: 60
-  watchlist: ["AAPL", "MSFT", "NVDA"]
+mcp:
+  market_data:
+    refresh_interval_minutes: 60
+    watchlist: ["RELIANCE", "TCS", "INFY"]
 ```

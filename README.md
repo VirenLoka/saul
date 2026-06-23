@@ -1,139 +1,169 @@
-# Financial Advisor AI Agent — MVP
+# MCP-Powered Financial Advisor AI Agent
 
-A **read-only, analytical** financial advisor agent. It ingests a customer
-portfolio (CSV), computes asset allocation deterministically, asks a configured
-LLM for qualitative diversification commentary, and prints a structured terminal
-report.
+A **read-only, analytical** financial advisor agent. It loads a customer
+portfolio (CSV), computes asset allocation deterministically, and runs an
+interactive chat loop against a local **vLLM** engine serving
+`Qwen/Qwen2.5-7B-Instruct`. Live **Indian market data** (NSE/BSE) is provided by
+a standalone **FastMCP** tool server attached to vLLM via `--tool-server`, so
+the model can fetch quotes and sector performance server-side during a turn.
 
-> **Scope guardrail:** This agent is strictly observational. It does **not**
-> execute trades, place orders, or take any financial action. Output is general
-> educational analysis, not personalized financial advice.
+> **Scope guardrail:** strictly observational. It never executes trades, places
+> orders, or takes any financial action. Output is general educational
+> analysis, not personalized advice.
 
-## Architecture at a glance
-
-Clean, decoupled layers — each swappable without touching the others:
+## Architecture
 
 ```
-config.yaml ──▶ config_loader.py ──▶ AppConfig (typed, immutable)
-                                        │
-   knowledge/portfolios/*.csv ──▶ data_ingestion.py ──▶ Portfolio
-                                        │
-                                  analysis.py (pure math, no LLM) ──▶ AnalysisResult
-                                        │
-                                  prompts.py (system + user prompt)
-                                        │
-                                  llm_provider.py  ◀── toggled by config
-                                  ┌── local: Qwen/Qwen2.5-7B-Instruct
-                                  │     (ollama | vllm | transformers)
-                                  ├── openai  (fallback)
-                                  ├── anthropic (fallback)
-                                  └── mock (offline, tests/CI)
-                                        │
-                                  report.py ──▶ terminal report
-                                        ▲
-                                  main.py orchestrates the loop
+                       ┌──────────────────────────────────────────┐
+   config.yaml ──▶ config_loader.py ──▶ AppConfig (typed, frozen)  │
+                       └──────────────────────────────────────────┘
+                                          │
+ knowledge/portfolios/*.csv ─▶ portfolio_parser.py ─▶ Portfolio
+                                          │
+                                   analysis.py (pure math) ─▶ allocation summary
+                                          │
+                                   prompts.py (system prompt + portfolio context)
+                                          │
+   ┌──────────────────────────── cli.py (interactive loop) ───────────────────────┐
+   │  • conversational memory (system/user/assistant/tool array)                   │
+   │  • streams reasoning, announces each MCP tool call, then the answer           │
+   └───────────────────────────────────┬───────────────────────────────────────────┘
+                                        │ llm_provider.py (OpenAI-compatible, streaming)
+                                        ▼
+                              vLLM server  (serve.sh)
+                              Qwen/Qwen2.5-7B-Instruct
+                              --enable-auto-tool-choice
+                              --tool-server ───────────────┐  (server-side tool exec)
+                                                            ▼
+                                          mcp_server.py  (FastMCP: indian-market-data)
+                                                            │
+                                          market_data.py  (yfinance .NS/.BO + mock fallback)
 ```
 
 Why this shape:
-* **Config-driven** — no model names or paths hardcoded; everything in
-  `config.yaml`, read once via `config_loader.py`.
-* **Provider abstraction** — `llm_provider.LLMProvider` is the only seam the app
-  depends on; switching Qwen ↔ OpenAI ↔ Anthropic is a one-line config change.
-* **Deterministic core** — all allocation math lives in `analysis.py`, fully
-  unit-tested without any model.
-* **Future-proof knowledge layer** — `knowledge/vector_db/` (RAG) and
-  `knowledge/market_data/` (NewsAPI/scrapes) are scaffolded with plug-in docs.
+* **Config-driven** — no model names, ports, or paths hardcoded; read once via
+  `config_loader.py`.
+* **MCP-native tools** — `mcp_server.py` is a standalone server; vLLM executes
+  its tools server-side. Adding tools (RAG, news) never touches the CLI.
+* **Decoupled, testable core** — allocation math (`analysis.py`) and market-data
+  logic (`market_data.py`) are pure Python with no MCP/LLM dependency, so the
+  whole suite runs offline with **no forward passes**.
+* **Uniform stream contract** — `llm_provider.py` normalizes both the real vLLM
+  stream and an offline mock into the same `StreamEvent` sequence, so `cli.py`
+  and its tests are backend-agnostic.
 
 ## Directory layout
 
 ```
 saul/
-├── config.yaml                 # central config: model_selection, local_inference_settings,
-│                               #   api_credentials (placeholders), storage_paths, analysis
-├── config_loader.py            # parse YAML -> typed, immutable AppConfig (env vars win for secrets)
-├── llm_provider.py             # abstract LLMProvider + Local Qwen / OpenAI / Anthropic / Mock + factory
-├── data_ingestion.py           # decoupled CSV -> Portfolio (validated, alias-tolerant)
-├── analysis.py                 # deterministic allocation / drift / concentration analytics
-├── prompts.py                  # system prompt + user-prompt builder
-├── report.py                   # terminal report renderer (dependency-free)
-├── main.py                     # orchestration entrypoint (CLI)
-├── requirements.txt
-├── .gitignore
-├── README.md
+├── config.yaml                 # model_selection, local_inference_settings,
+│                               #   mcp, api_credentials, storage_paths, analysis
+├── config_loader.py            # parse YAML -> typed, immutable AppConfig
+├── portfolio_parser.py         # decoupled CSV -> validated Portfolio
+├── market_data.py              # Indian market core (yfinance + mock) + tool schemas
+├── mcp_server.py               # FastMCP server wrapping the market-data tools
+├── llm_provider.py             # OpenAI-compatible streaming client to vLLM + mock
+├── analysis.py                 # deterministic allocation / drift / concentration
+├── prompts.py                  # agent system prompt + portfolio context builder
+├── cli.py                      # interactive chat loop (memory + reasoning/tool display)
+├── serve.sh                    # launch vLLM with --tool-server (MCP attached)
+├── requirements.txt · .gitignore · README.md
 ├── knowledge/                  # central data layer
-│   ├── portfolios/             # customer portfolio CSVs/JSONs
-│   │   ├── sample_portfolio.csv    # sample for testing/demo (tracked)
-│   │   ├── README.md
-│   │   └── .gitkeep
-│   ├── vector_db/              # FUTURE: Chroma/FAISS embeddings (contents ignored)
-│   │   ├── README.md
-│   │   └── .gitkeep
-│   └── market_data/            # FUTURE: NewsAPI payloads + scraped markdown (contents ignored)
-│       ├── README.md
-│       └── .gitkeep
+│   ├── portfolios/             # customer portfolio CSVs (sample tracked)
+│   │   ├── sample_portfolio.csv
+│   │   ├── README.md · .gitkeep
+│   ├── vector_db/              # FUTURE: Chroma/FAISS (contents ignored)
+│   │   ├── README.md · .gitkeep
+│   └── market_data/            # FUTURE: NewsAPI payloads / scrapes (contents ignored)
+│       ├── README.md · .gitkeep
 └── tests/
     ├── conftest.py
     ├── test_config_loader.py
-    ├── test_data_ingestion.py
+    ├── test_portfolio_parser.py
     ├── test_analysis.py
-    ├── test_llm_provider.py    # factory toggle + offline mock (no model run)
-    └── test_smoke.py           # full pipeline via mock provider
+    ├── test_market_data.py     # mocked yfinance — no network
+    ├── test_llm_provider.py    # factory + mock stream contract — no model
+    └── test_cli.py             # full loop via mock provider — no forward pass
 ```
 
-## Quick start
+## Execution — bring the whole stack up
+
+Three terminals. The MCP server must start **before** vLLM so `--tool-server`
+can connect.
 
 ```bash
-# 1. (optional) virtual env
+# 0. (once) install — serving host needs vllm + fastmcp + yfinance; client needs openai + pyyaml
 python3 -m venv .venv && source .venv/bin/activate
-
-# 2. install core deps
 pip install -r requirements.txt
+pip install "vllm>=0.6.0"          # serving host only
 
-# 3a. run OFFLINE (no model, deterministic stub) — works anywhere
-python main.py --provider mock
+# Shared bearer token (CLI + vLLM must agree)
+export SPARKS_API_KEY="$(openssl rand -hex 32)"
 
-# 3b. run against local Qwen via Ollama (requires the model pulled & daemon up)
-#     ollama pull qwen2.5:7b-instruct
-python main.py                       # provider defaults to 'local' in config.yaml
+# --- Terminal 1: MCP tool server (SSE on 127.0.0.1:8001 per config.yaml) -----
+python mcp_server.py
 
-# analyze a specific portfolio
-python main.py --portfolio knowledge/portfolios/sample_portfolio.csv
+# --- Terminal 2: vLLM engine with the MCP server attached --------------------
+bash serve.sh
+#   equivalently:
+#   vllm serve Qwen/Qwen2.5-7B-Instruct --host 127.0.0.1 --port 8000 \
+#     --enable-auto-tool-choice --tool-call-parser hermes \
+#     --tool-server http://127.0.0.1:8001/sse \
+#     --api-key "$SPARKS_API_KEY"
+
+# --- Terminal 3: the interactive agent ---------------------------------------
+python cli.py
 ```
 
-## Switching the LLM backend
+Example session:
+```
+you> How is the IT sector doing, and how does it relate to my equity weight?
+🧠 Reasoning: ...
+🔧 Invoking MCP tool: get_indian_sector_performance({"sector": "IT"})
+📊 Tool result [get_indian_sector_performance]: {...}
+💬 Answer: ...
+```
 
-Edit `model_selection.provider` in `config.yaml`:
+In-chat commands: `/help`, `/reset`, `/memory`, `/portfolio`, `/exit`.
 
-| provider    | uses                                              |
-|-------------|---------------------------------------------------|
-| `local`     | `Qwen/Qwen2.5-7B-Instruct` via `runner` (ollama/vllm/transformers) |
-| `openai`    | `OPENAI_API_KEY` env var (preferred) + `openai_model` |
-| `anthropic` | `ANTHROPIC_API_KEY` env var (preferred) + `anthropic_model` |
-| `mock`      | offline deterministic stub (tests/CI, no network) |
+## Offline / no-GPU usage
 
-Secrets are read from environment variables first; never commit real keys.
-
-## Testing
-
-Tests use the offline `mock` provider and pure-Python analytics — **no model
-forward passes** are performed.
+Everything runs without a model, network, or GPU using the deterministic mock
+provider and mock market data:
 
 ```bash
-python3 -m pytest -q          # 23 tests
+python cli.py --provider mock                       # interactive, offline
+python cli.py --provider mock --once "Quote for Reliance?"   # single turn
 ```
 
-## `.gitignore` policy (summary)
+Set `mcp.market_data.use_live: false` in `config.yaml` to force the MCP server
+to serve mock quotes too (no yfinance calls).
 
-Ignores `.venv`/`venv`, Python caches, secret files (`.env`, `*.secret`,
-`config.local.yaml`), local data caches, and the *contents* of
-`knowledge/vector_db/` and `knowledge/market_data/` plus `*.log` — while keeping
-the folder skeleton (`.gitkeep` + `README.md`) and the sample portfolio tracked.
+## Testing (no forward passes)
+
+The suite uses the mock provider and mocked market data — no model inference and
+no live network:
+
+```bash
+python3 -m pytest -q          # 37 tests
+python3 -m pytest tests/test_market_data.py -q     # market tool logic only
+python3 -m pytest tests/test_cli.py -q             # interactive loop + memory
+```
+
+## Configuration & secrets
+
+* `model_selection.provider`: `vllm` (default) or `mock`.
+* vLLM connection: `local_inference_settings.{host,port,api_key,...}`.
+* MCP: `mcp.{host,port,transport,tool_server_url}` and
+  `mcp.market_data.{default_exchange,use_live,cache_ttl_seconds}`.
+* Secrets are read from env first — `SPARKS_API_KEY` (vLLM), `OPENAI_API_KEY` /
+  `OPENAI_BASE_URL` (optional external), `NEWSAPI_KEY` (future). Never commit
+  real keys; the YAML holds empty placeholders.
 
 ## Future integration points
 
-* **Vector DB / RAG** → `knowledge/vector_db/` (see its README). Add
-  `vector_store.py` behind a small interface, persist to
-  `storage_paths.vector_db`, retrieve context into `prompts.build_user_prompt`.
-* **Real-time market data** → `knowledge/market_data/` (see its README). Add
-  `market_data_ingest.py` (NewsAPI + scraper), optionally embed into the vector
-  store. No changes needed to `llm_provider.py` or `analysis.py`.
+* **Vector DB / RAG** → `knowledge/vector_db/` (see its README): add
+  `vector_store.py`, persist to `storage_paths.vector_db`, expose retrieval as
+  another MCP tool and/or inject into the system context.
+* **Real-time news** → `knowledge/market_data/` (see its README): add NewsAPI /
+  scraper fetchers and surface them as new MCP tools in `mcp_server.py`.

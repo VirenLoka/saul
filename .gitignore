@@ -3,7 +3,7 @@
 # Goal: ignore environments, caches, secrets, and generated data — while
 # KEEPING the knowledge/ folder STRUCTURE intact (via tracked .gitkeep files).
 # =============================================================================
-
+listen.md
 # --- Python virtual environments --------------------------------------------
 .venv/
 venv/

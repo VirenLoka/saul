@@ -1,12 +1,11 @@
-"""Decoupled data ingestion for customer portfolios.
+"""Decoupled portfolio ingestion.
 
-The agent should never parse files inline. All on-disk portfolio data enters
-the system through this module, which converts raw CSV rows into validated,
-typed domain objects (:class:`Holding` / :class:`Portfolio`). Swapping the
-source later (a database, an API, JSON instead of CSV) only requires adding a
-new loader here — call sites stay unchanged.
+All on-disk portfolio data enters the system through this module, which converts
+raw CSV rows into validated, typed domain objects (:class:`Holding` /
+:class:`Portfolio`). Swapping the source later (a database, JSON, an API) only
+requires adding a new loader here — call sites stay unchanged.
 
-Expected CSV columns (case/whitespace-insensitive):
+Expected CSV columns (case/whitespace-insensitive; common aliases accepted):
     Ticker, Asset Class, Quantity, Current Value
 """
 
@@ -59,6 +58,10 @@ class Portfolio:
             totals[h.asset_class] = totals.get(h.asset_class, 0.0) + h.current_value
         return totals
 
+    def tickers(self) -> List[str]:
+        """All tickers in declaration order."""
+        return [h.ticker for h in self.holdings]
+
     def __len__(self) -> int:  # pragma: no cover - trivial
         return len(self.holdings)
 
@@ -83,7 +86,7 @@ def _normalize_header(header: List[str]) -> Dict[str, int]:
 
 def _to_float(value: str, *, field: str, row_num: int) -> float:
     """Parse a numeric cell, tolerating currency symbols, commas, and spaces."""
-    cleaned = (value or "").strip().replace(",", "").replace("$", "")
+    cleaned = (value or "").strip().replace(",", "").replace("$", "").replace("₹", "")
     if cleaned == "":
         raise PortfolioParseError(
             f"Row {row_num}: empty value for required numeric field '{field}'."
@@ -123,13 +126,11 @@ def load_portfolio(path: str | Path) -> Portfolio:
 
         # row_num starts at 2 to reflect the human-visible line (header == 1).
         for row_num, row in enumerate(reader, start=2):
-            # Skip fully blank lines gracefully.
             if not any(cell.strip() for cell in row):
-                continue
+                continue  # skip blank lines gracefully
             if len(row) < len(header):
                 raise PortfolioParseError(
-                    f"Row {row_num}: expected {len(header)} columns, "
-                    f"got {len(row)}."
+                    f"Row {row_num}: expected {len(header)} columns, got {len(row)}."
                 )
             ticker = row[cols["ticker"]].strip().upper()
             asset_class = row[cols["asset_class"]].strip()

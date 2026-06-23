@@ -1,17 +1,17 @@
-"""Configuration loader for the Financial Advisor AI Agent.
+"""Configuration loader for the MCP-Powered Financial Advisor AI Agent.
 
 Parses ``config.yaml`` once at startup and exposes a typed, read-only view of
-the settings. Source code should depend on this module rather than reading the
-YAML (or environment) directly, so configuration concerns stay in one place.
+the settings. Source code depends on this module rather than reading the YAML
+(or environment) directly, so configuration concerns stay in one place.
 
 Secrets policy
 --------------
-API keys are *never* required to live in the YAML file. Environment variables
+API keys are never required to live in the YAML file. Environment variables
 always take precedence over any value found in the file:
-  - ``SPARKS_API_KEY``   — vLLM bearer token (matches the serve.sh variable)
-  - ``OPENAI_API_KEY``   — OpenAI fallback
-  - ``ANTHROPIC_API_KEY``— Anthropic fallback
-This keeps real secrets out of version control.
+  - ``SPARKS_API_KEY``  — vLLM bearer token (matches serve.sh)
+  - ``OPENAI_API_KEY``  — optional external OpenAI-compatible fallback
+  - ``OPENAI_BASE_URL`` — optional external base URL
+  - ``NEWSAPI_KEY``     — future market_data ingestion
 """
 
 from __future__ import annotations
@@ -37,32 +37,52 @@ class ConfigError(RuntimeError):
 # --------------------------------------------------------------------------- #
 @dataclass(frozen=True)
 class ModelSelection:
-    provider: str
-    local_model: str
-    openai_model: str
-    anthropic_model: str
+    provider: str   # "vllm" | "mock"
+    model: str
 
 
 @dataclass(frozen=True)
 class LocalInferenceSettings:
-    host: str       # IP / hostname (no scheme, no port) — matches SPARKS_HOST
-    port: int       # TCP port of the vLLM server       — matches SPARKS_PORT
-    api_key: str    # Bearer token                       — from SPARKS_API_KEY env var
+    host: str
+    port: int
+    api_key: str
     temperature: float
     max_tokens: int
     request_timeout: int
+    stream: bool
 
     @property
     def base_url(self) -> str:
-        """Full base URL of the vLLM OpenAI-compatible endpoint."""
+        """OpenAI-compatible base URL of the vLLM server (without /v1)."""
         return f"http://{self.host}:{self.port}"
+
+    @property
+    def openai_base_url(self) -> str:
+        """Base URL including the /v1 suffix expected by the OpenAI SDK."""
+        return f"{self.base_url}/v1"
+
+
+@dataclass(frozen=True)
+class MarketDataSettings:
+    default_exchange: str   # "NS" | "BO"
+    use_live: bool
+    cache_ttl_seconds: int
+
+
+@dataclass(frozen=True)
+class McpSettings:
+    host: str
+    port: int
+    transport: str          # "sse" | "streamable-http"
+    tool_server_url: str
+    market_data: MarketDataSettings
 
 
 @dataclass(frozen=True)
 class ApiCredentials:
-    openai_api_key: str
-    openai_base_url: str
-    anthropic_api_key: str
+    newsapi_key: str
+    external_openai_api_key: str
+    external_openai_base_url: str
 
 
 @dataclass(frozen=True)
@@ -86,6 +106,7 @@ class AppConfig:
 
     model_selection: ModelSelection
     local_inference: LocalInferenceSettings
+    mcp: McpSettings
     api_credentials: ApiCredentials
     storage_paths: StoragePaths
     analysis: AnalysisSettings
@@ -95,12 +116,6 @@ class AppConfig:
 # --------------------------------------------------------------------------- #
 # Loading helpers
 # --------------------------------------------------------------------------- #
-def _require(section: Dict[str, Any], key: str, where: str) -> Any:
-    if key not in section:
-        raise ConfigError(f"Missing required key '{key}' in '{where}' section.")
-    return section[key]
-
-
 def _get_section(data: Dict[str, Any], name: str) -> Dict[str, Any]:
     section = data.get(name)
     if not isinstance(section, dict):
@@ -108,15 +123,14 @@ def _get_section(data: Dict[str, Any], name: str) -> Dict[str, Any]:
     return section
 
 
-def load_config(path: Optional[os.PathLike | str] = None) -> AppConfig:
-    """Load, validate, and return the application configuration.
+def _require(section: Dict[str, Any], key: str, where: str) -> Any:
+    if key not in section:
+        raise ConfigError(f"Missing required key '{key}' in '{where}' section.")
+    return section[key]
 
-    Parameters
-    ----------
-    path:
-        Optional override of the config file location. Defaults to the
-        ``config.yaml`` sitting next to this module.
-    """
+
+def load_config(path: Optional[os.PathLike | str] = None) -> AppConfig:
+    """Load, validate, and return the application configuration."""
     config_path = Path(path) if path else DEFAULT_CONFIG_PATH
     if not config_path.exists():
         raise ConfigError(f"Config file not found: {config_path}")
@@ -130,7 +144,7 @@ def load_config(path: Optional[os.PathLike | str] = None) -> AppConfig:
     # ---- model_selection ---------------------------------------------------
     ms = _get_section(data, "model_selection")
     provider = str(_require(ms, "provider", "model_selection")).lower()
-    valid_providers = {"local", "openai", "anthropic", "mock"}
+    valid_providers = {"vllm", "mock"}
     if provider not in valid_providers:
         raise ConfigError(
             f"model_selection.provider '{provider}' is invalid; "
@@ -138,9 +152,7 @@ def load_config(path: Optional[os.PathLike | str] = None) -> AppConfig:
         )
     model_selection = ModelSelection(
         provider=provider,
-        local_model=str(_require(ms, "local_model", "model_selection")),
-        openai_model=str(ms.get("openai_model", "gpt-4o-mini")),
-        anthropic_model=str(ms.get("anthropic_model", "claude-opus-4-8")),
+        model=str(_require(ms, "model", "model_selection")),
     )
 
     # ---- local_inference_settings ------------------------------------------
@@ -148,25 +160,39 @@ def load_config(path: Optional[os.PathLike | str] = None) -> AppConfig:
     local_inference = LocalInferenceSettings(
         host=str(li.get("host", "127.0.0.1")),
         port=int(li.get("port", 8000)),
-        # SPARKS_API_KEY env var takes precedence over the file value.
-        api_key=os.environ.get("SPARKS_API_KEY", "")
-        or str(li.get("api_key", "")),
+        api_key=os.environ.get("SPARKS_API_KEY", "") or str(li.get("api_key", "")),
         temperature=float(li.get("temperature", 0.2)),
         max_tokens=int(li.get("max_tokens", 1024)),
-        request_timeout=int(li.get("request_timeout", 120)),
+        request_timeout=int(li.get("request_timeout", 180)),
+        stream=bool(li.get("stream", True)),
+    )
+
+    # ---- mcp ---------------------------------------------------------------
+    mcp_section = _get_section(data, "mcp")
+    md = mcp_section.get("market_data", {}) or {}
+    mcp = McpSettings(
+        host=str(mcp_section.get("host", "127.0.0.1")),
+        port=int(mcp_section.get("port", 8001)),
+        transport=str(mcp_section.get("transport", "sse")).lower(),
+        tool_server_url=str(
+            mcp_section.get("tool_server_url", "http://127.0.0.1:8001/sse")
+        ),
+        market_data=MarketDataSettings(
+            default_exchange=str(md.get("default_exchange", "NS")).upper(),
+            use_live=bool(md.get("use_live", True)),
+            cache_ttl_seconds=int(md.get("cache_ttl_seconds", 60)),
+        ),
     )
 
     # ---- api_credentials (env vars win over file) --------------------------
     ac = data.get("api_credentials", {}) or {}
-    openai_block = ac.get("openai", {}) or {}
-    anthropic_block = ac.get("anthropic", {}) or {}
+    ext = ac.get("external_openai", {}) or {}
     api_credentials = ApiCredentials(
-        openai_api_key=os.environ.get("OPENAI_API_KEY", "")
-        or str(openai_block.get("api_key", "")),
-        openai_base_url=os.environ.get("OPENAI_BASE_URL", "")
-        or str(openai_block.get("base_url", "")),
-        anthropic_api_key=os.environ.get("ANTHROPIC_API_KEY", "")
-        or str(anthropic_block.get("api_key", "")),
+        newsapi_key=os.environ.get("NEWSAPI_KEY", "") or str(ac.get("newsapi_key", "")),
+        external_openai_api_key=os.environ.get("OPENAI_API_KEY", "")
+        or str(ext.get("api_key", "")),
+        external_openai_base_url=os.environ.get("OPENAI_BASE_URL", "")
+        or str(ext.get("base_url", "")),
     )
 
     # ---- storage_paths -----------------------------------------------------
@@ -192,6 +218,7 @@ def load_config(path: Optional[os.PathLike | str] = None) -> AppConfig:
     return AppConfig(
         model_selection=model_selection,
         local_inference=local_inference,
+        mcp=mcp,
         api_credentials=api_credentials,
         storage_paths=storage_paths,
         analysis=analysis,
@@ -201,8 +228,10 @@ def load_config(path: Optional[os.PathLike | str] = None) -> AppConfig:
 
 if __name__ == "__main__":  # pragma: no cover - manual sanity check
     cfg = load_config()
-    print("Provider    :", cfg.model_selection.provider)
-    print("Local model :", cfg.model_selection.local_model)
-    print("vLLM URL    :", cfg.local_inference.base_url)
-    print("API key set :", bool(cfg.local_inference.api_key))
-    print("Portfolios  :", cfg.storage_paths.portfolios)
+    print("Provider       :", cfg.model_selection.provider)
+    print("Model          :", cfg.model_selection.model)
+    print("vLLM URL       :", cfg.local_inference.openai_base_url)
+    print("API key set    :", bool(cfg.local_inference.api_key))
+    print("MCP tool server:", cfg.mcp.tool_server_url)
+    print("Market live     :", cfg.mcp.market_data.use_live)
+    print("Portfolios     :", cfg.storage_paths.portfolios)

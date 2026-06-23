@@ -16,7 +16,7 @@ from dataclasses import dataclass
 from typing import Dict, List
 
 from config_loader import AnalysisSettings
-from data_ingestion import Portfolio
+from portfolio_parser import Portfolio
 
 
 @dataclass(frozen=True)

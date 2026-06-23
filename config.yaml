@@ -1,60 +1,64 @@
 # =============================================================================
-# Financial Advisor AI Agent — Central Configuration
+# MCP-Powered Financial Advisor AI Agent — Central Configuration
 # =============================================================================
 # All runtime behavior is driven by this file. Source code must not hardcode
-# model names, file paths, or credentials. Edit values here; the application
-# reads them at startup via config_loader.py.
+# model names, ports, or credentials. Edit values here; the application reads
+# them at startup via config_loader.py.
 # -----------------------------------------------------------------------------
 
 # -----------------------------------------------------------------------------
 # model_selection
-#   Chooses which LLM backend the agent talks to.
-#   provider: one of [local, openai, anthropic, mock]
-#     - local     -> uses local_inference_settings + the Qwen model below
-#     - openai    -> uses api_credentials.openai
-#     - anthropic -> uses api_credentials.anthropic
-#     - mock      -> deterministic offline stub (no network, used for tests/CI)
+#   provider: which LLM backend the CLI talks to.
+#     - vllm  -> OpenAI-compatible requests to a local vLLM server (default)
+#     - mock  -> deterministic offline stub (no network; used for tests/CI)
+#   model: the served model identifier (must match vLLM --served-model-name).
 # -----------------------------------------------------------------------------
 model_selection:
-  provider: local
-  # Default local model identifier. Do NOT change unless you have the weights.
-  local_model: "Qwen/Qwen2.5-7B-Instruct"
-  # Fallback API models, used when provider is openai / anthropic.
-  openai_model: "gpt-4o-mini"
-  anthropic_model: "claude-opus-4-8"
+  provider: vllm
+  model: "Qwen/Qwen2.5-7B-Instruct"
 
 # -----------------------------------------------------------------------------
 # local_inference_settings
-#   The local runner is exclusively vLLM, launched via serve.sh.
-#   The vLLM process exposes an OpenAI-compatible HTTP endpoint protected by a
-#   bearer token (SPARKS_API_KEY). The loader prefers the env var over the
-#   file value so real secrets never need to be committed.
-#
-#   Matching env vars on the serve side (see serve.sh):
-#     SPARKS_HOST, SPARKS_PORT, SPARKS_API_KEY, SPARKS_MAX_MODEL_LEN,
-#     SPARKS_GPU_UTIL, SPARKS_TOOL_PARSER
+#   Connection + sampling knobs for the local vLLM server. The server exposes an
+#   OpenAI-compatible endpoint at http://<host>:<port>/v1 and is protected by a
+#   bearer token (api_key). The loader prefers env SPARKS_API_KEY over the file
+#   value so real secrets never need to be committed.
 # -----------------------------------------------------------------------------
 local_inference_settings:
-  host: "127.0.0.1"   # IP/hostname only — matches SPARKS_HOST in serve.sh
-  port: 8000           # matches SPARKS_PORT in serve.sh
-  api_key: ""          # or set env SPARKS_API_KEY (preferred; never commit real keys)
+  host: "127.0.0.1"      # matches SPARKS_HOST in serve.sh
+  port: 8000             # matches SPARKS_PORT in serve.sh
+  api_key: ""            # or set env SPARKS_API_KEY (preferred)
   temperature: 0.2
   max_tokens: 1024
-  # Request timeout in seconds.
-  request_timeout: 120
+  request_timeout: 180
+  stream: true           # stream tokens so the CLI can show live reasoning/tools
+
+# -----------------------------------------------------------------------------
+# mcp
+#   The standalone FastMCP tool server (mcp_server.py) is launched separately
+#   and ATTACHED to vLLM via `--tool-server <tool_server_url>` (see serve.sh).
+#   vLLM then invokes these tools server-side during generation.
+# -----------------------------------------------------------------------------
+mcp:
+  host: "127.0.0.1"
+  port: 8001
+  transport: "sse"                          # sse | streamable-http
+  tool_server_url: "http://127.0.0.1:8001/sse"   # what vLLM --tool-server connects to
+  market_data:
+    default_exchange: "NS"   # NS (NSE, *.NS) or BO (BSE, *.BO)
+    use_live: true           # true -> yfinance live fetch; false -> deterministic mock
+    cache_ttl_seconds: 60    # in-process quote cache to avoid hammering the API
 
 # -----------------------------------------------------------------------------
 # api_credentials
-#   PLACEHOLDERS ONLY. Never commit real secrets. Leave these empty and supply
-#   them via environment variables (OPENAI_API_KEY / ANTHROPIC_API_KEY); the
-#   loader prefers env vars over file values. See .gitignore for secret hygiene.
+#   PLACEHOLDERS ONLY. Never commit real secrets. Supply via environment
+#   variables; the loader prefers env vars over file values.
 # -----------------------------------------------------------------------------
 api_credentials:
-  openai:
-    api_key: ""        # or set env OPENAI_API_KEY
-    base_url: ""       # optional; for Azure / proxy endpoints
-  anthropic:
-    api_key: ""        # or set env ANTHROPIC_API_KEY
+  newsapi_key: ""          # or env NEWSAPI_KEY (future: knowledge/market_data ingestion)
+  external_openai:         # optional non-vLLM OpenAI-compatible fallback
+    api_key: ""            # or env OPENAI_API_KEY
+    base_url: ""           # or env OPENAI_BASE_URL
 
 # -----------------------------------------------------------------------------
 # storage_paths
@@ -65,14 +69,12 @@ storage_paths:
   portfolios: "knowledge/portfolios"
   market_data: "knowledge/market_data"
   vector_db: "knowledge/vector_db"
-  # Default portfolio used by main.py when --portfolio is not passed.
   default_portfolio: "knowledge/portfolios/sample_portfolio.csv"
 
 # -----------------------------------------------------------------------------
 # analysis
 #   Target allocation bands (percent of total value) used to generate
-#   diversification commentary. These are illustrative standard-of-practice
-#   reference bands, NOT personalized financial advice.
+#   diversification commentary. Illustrative reference bands, NOT advice.
 # -----------------------------------------------------------------------------
 analysis:
   target_allocation:
@@ -81,6 +83,4 @@ analysis:
     Cash: 5
     Commodity: 5
     "Real Estate": 5
-  # How many percentage points an asset class may drift from target before the
-  # report flags it as over- or under-weight.
   drift_tolerance_pct: 10

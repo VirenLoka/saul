@@ -6,7 +6,7 @@ import pytest
 
 from analysis import analyze_portfolio
 from config_loader import AnalysisSettings
-from data_ingestion import Holding, Portfolio
+from portfolio_parser import Holding, Portfolio
 
 SETTINGS = AnalysisSettings(
     target_allocation={"Equity": 60, "Bond": 25, "Cash": 5, "Commodity": 5,

@@ -1,55 +1,51 @@
-"""Prompt construction for the financial analyst agent.
+"""System prompt construction for the MCP-powered financial analyst agent.
 
-Centralizes the system prompt and the user-prompt builder so prompt
-engineering stays in one place, separate from orchestration and I/O.
+Centralizes the agent persona so prompt engineering stays separate from
+orchestration. The prompt establishes the read-only scope and instructs the
+model to use the attached MCP market-data tools when live figures are needed.
 """
 
 from __future__ import annotations
 
 import json
-from typing import Dict
+from typing import Dict, Optional
 
-# Robust analyst persona. Note the explicit read-only / non-advisory guardrails,
-# which match the agent's observational scope.
-SYSTEM_PROMPT = """\
+AGENT_SYSTEM_PROMPT = """\
 You are a meticulous financial portfolio analyst AI operating in a strictly \
-READ-ONLY, observational capacity. You analyze portfolio data and explain what \
-you see. You do NOT and CANNOT execute trades, place orders, or take any \
-financial action.
+READ-ONLY, observational capacity. You analyze portfolio data, call tools to \
+fetch external market data, and explain what you observe. You do NOT and CANNOT \
+execute trades, place orders, or take any financial action.
 
-Your responsibilities:
-1. Interpret the provided allocation figures (already computed for you).
-2. Explain the portfolio's diversification profile across asset classes.
-3. Identify concentration risk, over-/under-weight classes versus the target \
-bands, and any target asset classes that are entirely missing.
-4. Offer clear, principle-based diversification considerations (e.g. spreading \
-across asset classes, reducing single-name concentration, aligning toward the \
-stated target bands).
+Tools available to you (via the attached MCP server):
+- get_indian_stock_quote(query, exchange): real-time quote for one Indian stock.
+- get_indian_sector_performance(sector, exchange): aggregate sector performance.
 
-Rules:
-- Ground every statement in the numbers given. Do not invent holdings or prices.
-- Be concise and structured. Use short sections and bullet points.
-- Frame everything as general educational analysis, not personalized advice.
-- Always include a one-line disclaimer that this is not financial advice and no \
-trades are being executed.
-- Never suggest specific buy/sell orders, quantities, or timing. Speak only in \
-terms of allocation principles and observations.
+How to work:
+1. When a question needs current market figures (a price, a move, sector
+   performance), call the appropriate tool rather than guessing.
+2. Ground every quantitative statement in either the user's portfolio data
+   (provided below) or tool results. Never invent prices or holdings.
+3. Be concise and structured: short sections and bullet points.
+4. Frame everything as general educational analysis, not personalized advice.
+5. Never suggest specific buy/sell orders, quantities, or timing. Speak only in
+   terms of allocation principles and observations.
+6. End substantive answers with a one-line reminder that this is not financial
+   advice and no trades are being executed.
 """
 
 
-def build_user_prompt(analysis_summary: Dict[str, object]) -> str:
-    """Render the computed analysis into a deterministic user prompt."""
+def build_portfolio_context(analysis_summary: Optional[Dict[str, object]]) -> str:
+    """Render the pre-computed portfolio analysis as a system context block.
+
+    Returned as a string to append to the system prompt so the agent always has
+    the customer's allocation in view. Returns an empty string when no portfolio
+    is loaded.
+    """
+    if not analysis_summary:
+        return ""
     payload = json.dumps(analysis_summary, indent=2, sort_keys=True)
     return (
-        "Here is the pre-computed analysis of a customer's portfolio. All "
-        "percentages are shares of total portfolio value. 'target_pct' is the "
-        "reference target band; 'drift_pct' is actual minus target; 'status' "
-        "flags overweight/underweight/on-target/untracked.\n\n"
-        f"PORTFOLIO ANALYSIS (JSON):\n{payload}\n\n"
-        "Produce a structured report with these sections:\n"
-        "1. Allocation Overview\n"
-        "2. Diversification Assessment (concentration + drift vs target)\n"
-        "3. Gaps & Observations (missing target classes, risks)\n"
-        "4. Principle-Based Recommendations (no specific orders)\n"
-        "End with the required not-financial-advice disclaimer."
+        "\n\nCUSTOMER PORTFOLIO (pre-computed allocation analysis; percentages "
+        "are shares of total value; 'status' flags drift vs target bands):\n"
+        f"{payload}\n"
     )

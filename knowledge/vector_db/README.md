@@ -18,12 +18,14 @@ The clean seam already exists: everything reads paths from
    `class VectorStore: upsert(docs); query(text, k) -> list[Chunk]`.
 2. Implement `ChromaVectorStore` / `FaissVectorStore` behind that interface,
    persisting to `config.storage_paths.vector_db`.
-3. In `main.py`, after ingestion, retrieve relevant context (e.g. prior
-   analyses, research notes, market summaries) and append it to the user prompt
-   built in `prompts.build_user_prompt`.
+3. In `cli.py`, before each turn, retrieve relevant context (e.g. prior
+   analyses, research notes, market summaries) and append it to the system
+   context via `prompts.build_portfolio_context` (or a sibling builder).
+4. Optionally expose retrieval as another MCP tool in `mcp_server.py` so the
+   model can pull context on demand, exactly like the market-data tools.
 
-Because the LLM and prompt layers are already decoupled, wiring RAG in does not
-touch `llm_provider.py` or `analysis.py`.
+Because the LLM, prompt, and tool layers are already decoupled, wiring RAG in
+does not touch `llm_provider.py` or `analysis.py`.
 
 ## Suggested config block (add when implementing)
 
