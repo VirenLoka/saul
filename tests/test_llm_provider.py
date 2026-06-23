@@ -33,11 +33,20 @@ def test_factory_returns_mock_when_selected():
 
 
 def test_factory_returns_local_qwen_by_default():
-    cfg = load_config()  # bundled config defaults to local Qwen
+    cfg = load_config()  # bundled config defaults to local Qwen via vLLM
     provider = get_provider(cfg)
     assert isinstance(provider, LocalQwenProvider)
     assert provider.model_id == "Qwen/Qwen2.5-7B-Instruct"
     assert "Qwen2.5-7B-Instruct" in provider.describe()
+    assert "vllm" in provider.describe()
+
+
+def test_local_provider_builds_correct_url():
+    cfg = load_config()
+    provider = LocalQwenProvider(cfg)
+    assert provider.settings.base_url == (
+        f"http://{cfg.local_inference.host}:{cfg.local_inference.port}"
+    )
 
 
 def test_api_providers_require_keys():
@@ -46,14 +55,6 @@ def test_api_providers_require_keys():
         OpenAIProvider(_with_provider(cfg, "openai"))
     with pytest.raises(LLMProviderError):
         AnthropicProvider(_with_provider(cfg, "anthropic"))
-
-
-def test_unknown_local_runner_errors():
-    cfg = load_config()
-    provider = LocalQwenProvider(cfg)
-    provider.settings = _replace(provider.settings, runner="bogus")
-    with pytest.raises(LLMProviderError):
-        provider.generate("sys", "user")
 
 
 # --- small helpers ----------------------------------------------------------

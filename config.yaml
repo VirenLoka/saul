@@ -25,19 +25,22 @@ model_selection:
 
 # -----------------------------------------------------------------------------
 # local_inference_settings
-#   Knobs for the local runner. `runner` selects HOW the local model is served.
-#     - ollama       -> talks to a running Ollama daemon over HTTP
-#     - vllm         -> talks to a vLLM OpenAI-compatible server
-#     - transformers -> loads weights in-process via Hugging Face Transformers
+#   The local runner is exclusively vLLM, launched via serve.sh.
+#   The vLLM process exposes an OpenAI-compatible HTTP endpoint protected by a
+#   bearer token (SPARKS_API_KEY). The loader prefers the env var over the
+#   file value so real secrets never need to be committed.
+#
+#   Matching env vars on the serve side (see serve.sh):
+#     SPARKS_HOST, SPARKS_PORT, SPARKS_API_KEY, SPARKS_MAX_MODEL_LEN,
+#     SPARKS_GPU_UTIL, SPARKS_TOOL_PARSER
 # -----------------------------------------------------------------------------
 local_inference_settings:
-  runner: "ollama"
-  host: "http://localhost:11434"     # ollama / vllm endpoint
+  host: "127.0.0.1"   # IP/hostname only — matches SPARKS_HOST in serve.sh
+  port: 8000           # matches SPARKS_PORT in serve.sh
+  api_key: ""          # or set env SPARKS_API_KEY (preferred; never commit real keys)
   temperature: 0.2
   max_tokens: 1024
-  # Ollama tag for the model (Ollama uses lowercase tags, not HF repo ids).
-  ollama_tag: "qwen2.5:7b-instruct"
-  # Request timeout in seconds for any networked local runner.
+  # Request timeout in seconds.
   request_timeout: 120
 
 # -----------------------------------------------------------------------------

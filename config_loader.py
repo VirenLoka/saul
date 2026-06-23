@@ -7,8 +7,11 @@ YAML (or environment) directly, so configuration concerns stay in one place.
 Secrets policy
 --------------
 API keys are *never* required to live in the YAML file. Environment variables
-(``OPENAI_API_KEY`` / ``ANTHROPIC_API_KEY``) always take precedence over any
-value found in the file. This keeps real secrets out of version control.
+always take precedence over any value found in the file:
+  - ``SPARKS_API_KEY``   — vLLM bearer token (matches the serve.sh variable)
+  - ``OPENAI_API_KEY``   — OpenAI fallback
+  - ``ANTHROPIC_API_KEY``— Anthropic fallback
+This keeps real secrets out of version control.
 """
 
 from __future__ import annotations
@@ -42,12 +45,17 @@ class ModelSelection:
 
 @dataclass(frozen=True)
 class LocalInferenceSettings:
-    runner: str
-    host: str
+    host: str       # IP / hostname (no scheme, no port) — matches SPARKS_HOST
+    port: int       # TCP port of the vLLM server       — matches SPARKS_PORT
+    api_key: str    # Bearer token                       — from SPARKS_API_KEY env var
     temperature: float
     max_tokens: int
-    ollama_tag: str
     request_timeout: int
+
+    @property
+    def base_url(self) -> str:
+        """Full base URL of the vLLM OpenAI-compatible endpoint."""
+        return f"http://{self.host}:{self.port}"
 
 
 @dataclass(frozen=True)
@@ -138,11 +146,13 @@ def load_config(path: Optional[os.PathLike | str] = None) -> AppConfig:
     # ---- local_inference_settings ------------------------------------------
     li = _get_section(data, "local_inference_settings")
     local_inference = LocalInferenceSettings(
-        runner=str(li.get("runner", "ollama")).lower(),
-        host=str(li.get("host", "http://localhost:11434")),
+        host=str(li.get("host", "127.0.0.1")),
+        port=int(li.get("port", 8000)),
+        # SPARKS_API_KEY env var takes precedence over the file value.
+        api_key=os.environ.get("SPARKS_API_KEY", "")
+        or str(li.get("api_key", "")),
         temperature=float(li.get("temperature", 0.2)),
         max_tokens=int(li.get("max_tokens", 1024)),
-        ollama_tag=str(li.get("ollama_tag", "qwen2.5:7b-instruct")),
         request_timeout=int(li.get("request_timeout", 120)),
     )
 
@@ -191,7 +201,8 @@ def load_config(path: Optional[os.PathLike | str] = None) -> AppConfig:
 
 if __name__ == "__main__":  # pragma: no cover - manual sanity check
     cfg = load_config()
-    print("Provider     :", cfg.model_selection.provider)
-    print("Local model  :", cfg.model_selection.local_model)
-    print("Local runner :", cfg.local_inference.runner)
-    print("Portfolios   :", cfg.storage_paths.portfolios)
+    print("Provider    :", cfg.model_selection.provider)
+    print("Local model :", cfg.model_selection.local_model)
+    print("vLLM URL    :", cfg.local_inference.base_url)
+    print("API key set :", bool(cfg.local_inference.api_key))
+    print("Portfolios  :", cfg.storage_paths.portfolios)

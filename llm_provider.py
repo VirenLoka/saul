@@ -2,17 +2,23 @@
 
 This module decouples the rest of the application from any specific inference
 backend. Everything downstream depends only on the :class:`LLMProvider`
-interface; the concrete backend (local Qwen via Ollama/vLLM/Transformers, or an
-external API such as OpenAI / Anthropic) is selected at runtime from config.
+interface; the concrete backend is selected at runtime from config.
+
+Local backend
+-------------
+The sole local runner is **vLLM**, launched via ``serve.sh``. It exposes an
+OpenAI-compatible ``/v1/chat/completions`` endpoint on
+``http://<host>:<port>`` and is protected by a bearer token
+(``SPARKS_API_KEY`` env var / ``local_inference_settings.api_key`` in config).
 
 Design goals
 ------------
 * One narrow interface: ``generate(system_prompt, user_prompt) -> str``.
 * Backends are constructed by a single :func:`get_provider` factory driven by
   ``AppConfig``, so swapping models never touches call sites.
-* Heavy / optional dependencies (``requests``, ``openai``, ``anthropic``,
-  ``transformers``) are imported lazily *inside* each provider, so importing
-  this module — and running the unit/smoke tests — needs none of them.
+* Heavy / optional dependencies (``requests``, ``openai``, ``anthropic``)
+  are imported lazily *inside* each provider, so importing this module —
+  and running the unit/smoke tests — needs none of them.
 """
 
 from __future__ import annotations
@@ -48,68 +54,30 @@ class LLMProvider(abc.ABC):
 
 
 # --------------------------------------------------------------------------- #
-# Local backend (default): Qwen/Qwen2.5-7B-Instruct
+# Local backend: Qwen/Qwen2.5-7B-Instruct served by vLLM
 # --------------------------------------------------------------------------- #
 class LocalQwenProvider(LLMProvider):
-    """Serves ``Qwen/Qwen2.5-7B-Instruct`` through a local runner.
+    """Calls the local vLLM server (launched via serve.sh).
 
-    Supported runners (config: ``local_inference_settings.runner``):
-      * ``ollama``       — HTTP call to a local Ollama daemon.
-      * ``vllm``         — HTTP call to a vLLM OpenAI-compatible server.
-      * ``transformers`` — in-process Hugging Face Transformers pipeline.
+    The server exposes an OpenAI-compatible ``/v1/chat/completions`` endpoint.
+    If ``local_inference_settings.api_key`` is set (or ``SPARKS_API_KEY`` env
+    var is present), every request carries ``Authorization: Bearer <key>``.
     """
 
     def __init__(self, config: "AppConfig") -> None:
         self.config = config
         self.model_id = config.model_selection.local_model
         self.settings = config.local_inference
-        self.name = f"local:{self.settings.runner}:{self.model_id}"
+        self.name = f"local:vllm:{self.model_id}"
 
-    # -- public ------------------------------------------------------------- #
     def generate(self, system_prompt: str, user_prompt: str) -> str:
-        runner = self.settings.runner
-        if runner == "ollama":
-            return self._generate_ollama(system_prompt, user_prompt)
-        if runner == "vllm":
-            return self._generate_vllm(system_prompt, user_prompt)
-        if runner == "transformers":
-            return self._generate_transformers(system_prompt, user_prompt)
-        raise LLMProviderError(
-            f"Unknown local runner '{runner}'. "
-            "Expected one of: ollama, vllm, transformers."
-        )
-
-    # -- runners ------------------------------------------------------------ #
-    def _generate_ollama(self, system_prompt: str, user_prompt: str) -> str:
         import requests  # lazy import
 
-        url = f"{self.settings.host.rstrip('/')}/api/chat"
-        payload = {
-            "model": self.settings.ollama_tag,
-            "stream": False,
-            "messages": [
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt},
-            ],
-            "options": {
-                "temperature": self.settings.temperature,
-                "num_predict": self.settings.max_tokens,
-            },
-        }
-        try:
-            resp = requests.post(
-                url, json=payload, timeout=self.settings.request_timeout
-            )
-            resp.raise_for_status()
-            data = resp.json()
-        except Exception as exc:  # noqa: BLE001 - surface as provider error
-            raise LLMProviderError(f"Ollama request failed: {exc}") from exc
-        return data.get("message", {}).get("content", "").strip()
+        url = f"{self.settings.base_url}/v1/chat/completions"
+        headers = {"Content-Type": "application/json"}
+        if self.settings.api_key:
+            headers["Authorization"] = f"Bearer {self.settings.api_key}"
 
-    def _generate_vllm(self, system_prompt: str, user_prompt: str) -> str:
-        import requests  # lazy import
-
-        url = f"{self.settings.host.rstrip('/')}/v1/chat/completions"
         payload = {
             "model": self.model_id,
             "temperature": self.settings.temperature,
@@ -121,43 +89,18 @@ class LocalQwenProvider(LLMProvider):
         }
         try:
             resp = requests.post(
-                url, json=payload, timeout=self.settings.request_timeout
+                url,
+                json=payload,
+                headers=headers,
+                timeout=self.settings.request_timeout,
             )
             resp.raise_for_status()
             data = resp.json()
         except Exception as exc:  # noqa: BLE001
-            raise LLMProviderError(f"vLLM request failed: {exc}") from exc
-        return data["choices"][0]["message"]["content"].strip()
-
-    def _generate_transformers(self, system_prompt: str, user_prompt: str) -> str:
-        try:
-            from transformers import pipeline  # lazy import
-        except Exception as exc:  # noqa: BLE001
             raise LLMProviderError(
-                "transformers is not installed. "
-                "Install with: pip install 'transformers[torch]'"
+                f"vLLM request to {url} failed: {exc}"
             ) from exc
-
-        # Cache the pipeline on the instance so weights load once.
-        pipe = getattr(self, "_pipe", None)
-        if pipe is None:
-            pipe = pipeline("text-generation", model=self.model_id)
-            self._pipe = pipe
-
-        messages = [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_prompt},
-        ]
-        out = pipe(
-            messages,
-            max_new_tokens=self.settings.max_tokens,
-            temperature=self.settings.temperature,
-        )
-        # transformers returns the full chat; take the last assistant turn.
-        generated = out[0]["generated_text"]
-        if isinstance(generated, list):
-            return generated[-1]["content"].strip()
-        return str(generated).strip()
+        return data["choices"][0]["message"]["content"].strip()
 
 
 # --------------------------------------------------------------------------- #
