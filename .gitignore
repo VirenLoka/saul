@@ -1,0 +1,70 @@
+# =============================================================================
+# Financial Advisor AI Agent — .gitignore
+# Goal: ignore environments, caches, secrets, and generated data — while
+# KEEPING the knowledge/ folder STRUCTURE intact (via tracked .gitkeep files).
+# =============================================================================
+
+# --- Python virtual environments --------------------------------------------
+.venv/
+venv/
+env/
+ENV/
+
+# --- Python bytecode / build caches ------------------------------------------
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+build/
+dist/
+*.egg-info/
+
+# --- Configuration secrets ----------------------------------------------------
+# Never commit real credentials. Keep the committed config.yaml as a template
+# with empty placeholders; put real values in an untracked local override or
+# environment variables.
+.env
+.env.*
+*.secret
+*.secret.yaml
+secrets.yaml
+config.local.yaml
+config.*.local.yaml
+
+# --- Local data caches --------------------------------------------------------
+.cache/
+*.cache
+tmp/
+*.tmp
+
+# =============================================================================
+# knowledge/ data layer
+#   We track the directory skeleton + README/.gitkeep + the sample portfolio,
+#   but ignore generated indexes, fetched market data, and logs.
+# =============================================================================
+
+# Vector DB: ignore ALL generated index contents, keep the folder + docs.
+knowledge/vector_db/*
+!knowledge/vector_db/.gitkeep
+!knowledge/vector_db/README.md
+
+# Market data: ignore fetched payloads, scrapes, and temporary logs; keep docs.
+knowledge/market_data/*
+!knowledge/market_data/.gitkeep
+!knowledge/market_data/README.md
+*.log
+
+# Portfolios: ignore real customer files; keep the sample + docs.
+knowledge/portfolios/*
+!knowledge/portfolios/.gitkeep
+!knowledge/portfolios/README.md
+!knowledge/portfolios/sample_portfolio.csv
+
+# --- OS / editor noise --------------------------------------------------------
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp

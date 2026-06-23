@@ -1,0 +1,83 @@
+# =============================================================================
+# Financial Advisor AI Agent — Central Configuration
+# =============================================================================
+# All runtime behavior is driven by this file. Source code must not hardcode
+# model names, file paths, or credentials. Edit values here; the application
+# reads them at startup via config_loader.py.
+# -----------------------------------------------------------------------------
+
+# -----------------------------------------------------------------------------
+# model_selection
+#   Chooses which LLM backend the agent talks to.
+#   provider: one of [local, openai, anthropic, mock]
+#     - local     -> uses local_inference_settings + the Qwen model below
+#     - openai    -> uses api_credentials.openai
+#     - anthropic -> uses api_credentials.anthropic
+#     - mock      -> deterministic offline stub (no network, used for tests/CI)
+# -----------------------------------------------------------------------------
+model_selection:
+  provider: local
+  # Default local model identifier. Do NOT change unless you have the weights.
+  local_model: "Qwen/Qwen2.5-7B-Instruct"
+  # Fallback API models, used when provider is openai / anthropic.
+  openai_model: "gpt-4o-mini"
+  anthropic_model: "claude-opus-4-8"
+
+# -----------------------------------------------------------------------------
+# local_inference_settings
+#   Knobs for the local runner. `runner` selects HOW the local model is served.
+#     - ollama       -> talks to a running Ollama daemon over HTTP
+#     - vllm         -> talks to a vLLM OpenAI-compatible server
+#     - transformers -> loads weights in-process via Hugging Face Transformers
+# -----------------------------------------------------------------------------
+local_inference_settings:
+  runner: "ollama"
+  host: "http://localhost:11434"     # ollama / vllm endpoint
+  temperature: 0.2
+  max_tokens: 1024
+  # Ollama tag for the model (Ollama uses lowercase tags, not HF repo ids).
+  ollama_tag: "qwen2.5:7b-instruct"
+  # Request timeout in seconds for any networked local runner.
+  request_timeout: 120
+
+# -----------------------------------------------------------------------------
+# api_credentials
+#   PLACEHOLDERS ONLY. Never commit real secrets. Leave these empty and supply
+#   them via environment variables (OPENAI_API_KEY / ANTHROPIC_API_KEY); the
+#   loader prefers env vars over file values. See .gitignore for secret hygiene.
+# -----------------------------------------------------------------------------
+api_credentials:
+  openai:
+    api_key: ""        # or set env OPENAI_API_KEY
+    base_url: ""       # optional; for Azure / proxy endpoints
+  anthropic:
+    api_key: ""        # or set env ANTHROPIC_API_KEY
+
+# -----------------------------------------------------------------------------
+# storage_paths
+#   The central knowledge/ data layer. Keep these in sync with the on-disk tree.
+# -----------------------------------------------------------------------------
+storage_paths:
+  knowledge_root: "knowledge"
+  portfolios: "knowledge/portfolios"
+  market_data: "knowledge/market_data"
+  vector_db: "knowledge/vector_db"
+  # Default portfolio used by main.py when --portfolio is not passed.
+  default_portfolio: "knowledge/portfolios/sample_portfolio.csv"
+
+# -----------------------------------------------------------------------------
+# analysis
+#   Target allocation bands (percent of total value) used to generate
+#   diversification commentary. These are illustrative standard-of-practice
+#   reference bands, NOT personalized financial advice.
+# -----------------------------------------------------------------------------
+analysis:
+  target_allocation:
+    Equity: 60
+    Bond: 25
+    Cash: 5
+    Commodity: 5
+    "Real Estate": 5
+  # How many percentage points an asset class may drift from target before the
+  # report flags it as over- or under-weight.
+  drift_tolerance_pct: 10

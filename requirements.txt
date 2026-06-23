@@ -1,0 +1,15 @@
+# Core (required to run the MVP)
+PyYAML>=6.0
+
+# --- Optional backends (install only what you use) ---------------------------
+# Local runners (ollama / vllm use a plain HTTP call):
+requests>=2.31         # needed for runner: ollama or vllm
+# In-process Hugging Face inference (runner: transformers) — heavy:
+# transformers[torch]>=4.44
+
+# External API fallbacks:
+# openai>=1.30          # provider: openai
+# anthropic>=0.39       # provider: anthropic
+
+# --- Dev / test ---------------------------------------------------------------
+pytest>=8.0

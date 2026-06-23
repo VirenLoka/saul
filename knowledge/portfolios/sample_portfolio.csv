@@ -1,0 +1,10 @@
+Ticker,Asset Class,Quantity,Current Value
+AAPL,Equity,50,10500.00
+MSFT,Equity,30,12600.00
+NVDA,Equity,20,24000.00
+VTI,Equity,40,9800.00
+BND,Bond,100,7200.00
+TLT,Bond,50,4500.00
+GLD,Commodity,25,5500.00
+VNQ,Real Estate,30,2550.00
+CASH,Cash,1,3000.00
