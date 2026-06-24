@@ -57,10 +57,19 @@ class LocalInferenceSettings:
     max_tokens: int
     request_timeout: int
     stream: bool
+    # Optional full base-URL override (env SPARKS_BASE_URL). Useful in Docker
+    # when the engine lives in another container and host:port from the file
+    # isn't reachable, e.g. "http://172.23.0.4:8000". Wins over host/port.
+    base_url_override: str = ""
 
     @property
     def base_url(self) -> str:
         """OpenAI-compatible base URL of the engine (without /v1)."""
+        if self.base_url_override:
+            # Accept values with or without a trailing /v1.
+            return self.base_url_override.rstrip("/")[: -len("/v1")] \
+                if self.base_url_override.rstrip("/").endswith("/v1") \
+                else self.base_url_override.rstrip("/")
         return f"http://{self.host}:{self.port}"
 
     @property
@@ -192,6 +201,7 @@ def load_config(
         max_tokens=int(li.get("max_tokens", 1024)),
         request_timeout=int(li.get("request_timeout", 180)),
         stream=bool(li.get("stream", True)),
+        base_url_override=os.environ.get("SPARKS_BASE_URL", "").strip(),
     )
 
     # ---- mcp ---------------------------------------------------------------

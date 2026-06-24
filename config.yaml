@@ -18,7 +18,7 @@
 #     - mock    -> deterministic offline stub (no network; used for tests/CI)
 # -----------------------------------------------------------------------------
 model_selection:
-  provider: ollama         # vllm | ollama | mock
+  provider: vllm           # vllm | ollama | mock
 
 # -----------------------------------------------------------------------------
 # local_inference_settings
@@ -38,8 +38,14 @@ local_inference_settings:
 
   vllm:
     model: "Qwen/Qwen2.5-7B-Instruct"   # HF repo id / vLLM --served-model-name
-    host: "0.0.0.0"                    # matches SPARKS_HOST in serve.sh
-    port: 8000                           # matches SPARKS_PORT in serve.sh
+    # CLIENT connect address (where the CLI reaches vLLM) — this is NOT the
+    # serve.sh bind host. serve.sh binds 0.0.0.0 (listen on all interfaces);
+    # the client must dial a concrete reachable host:
+    #   * same container / host network -> 127.0.0.1
+    #   * separate Docker container      -> the vLLM service name or its
+    #     172.x.x.x address, OR just export SPARKS_BASE_URL=http://HOST:8000
+    host: "127.0.0.1"
+    port: 8000
     api_key: ""                          # or env SPARKS_API_KEY (preferred)
 
   ollama:

@@ -31,11 +31,14 @@ from __future__ import annotations
 
 import abc
 import json
+import logging
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Dict, Iterator, List, Optional
 
 if TYPE_CHECKING:  # avoid a hard runtime dependency / import cycle
     from config_loader import AppConfig
+
+logger = logging.getLogger("saul.llm")
 
 
 class LLMProviderError(RuntimeError):
@@ -107,11 +110,29 @@ class OpenAICompatibleProvider(LLMProvider):
             raise LLMProviderError(
                 "openai package not installed. Install with: pip install openai"
             ) from exc
+        logger.debug(
+            "Creating OpenAI client engine=%s base_url=%s timeout=%ss api_key=%s",
+            self.engine_label,
+            self.settings.openai_base_url,
+            self.settings.request_timeout,
+            "set" if self.settings.api_key else "EMPTY",
+        )
         return OpenAI(
             base_url=self.settings.openai_base_url,
             # vLLM requires a non-empty key; Ollama ignores it. "EMPTY" satisfies both.
             api_key=self.settings.api_key or "EMPTY",
             timeout=self.settings.request_timeout,
+        )
+
+    def _connection_hint(self, exc: Exception) -> str:
+        """Build an actionable error message for connection-type failures."""
+        url = self.settings.openai_base_url
+        return (
+            f"Could not reach the {self.engine_label} server at {url} ({exc}). "
+            f"Check the server is running and reachable from here. In Docker, the "
+            f"engine may be in another container — set SPARKS_BASE_URL="
+            f"http://<host>:<port> (note: 0.0.0.0 is a bind address, not a "
+            f"connect address)."
         )
 
     def stream_chat(
@@ -131,12 +152,26 @@ class OpenAICompatibleProvider(LLMProvider):
             kwargs["tools"] = tools
             kwargs["tool_choice"] = "auto"
 
+        logger.info(
+            "Chat request -> %s model=%s msgs=%d tools=%s",
+            self.settings.openai_base_url,
+            self.model,
+            len(messages),
+            bool(tools),
+        )
         try:
             stream = client.chat.completions.create(**kwargs)
         except Exception as exc:  # noqa: BLE001
-            yield StreamEvent(
-                type="error", text=f"{self.engine_label} request failed: {exc}"
+            # Connection-class failures get an actionable hint; everything else
+            # is surfaced verbatim. Full traceback is logged at debug level.
+            name = type(exc).__name__
+            is_conn = "Connection" in name or "Timeout" in name or "APIConnection" in name
+            msg = self._connection_hint(exc) if is_conn else (
+                f"{self.engine_label} request failed: {exc}"
             )
+            logger.error("Chat request failed (%s): %s", name, exc)
+            logger.debug("Chat request traceback", exc_info=True)
+            yield StreamEvent(type="error", text=msg)
             yield StreamEvent(type="done", finish_reason="error")
             return
 

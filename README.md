@@ -185,6 +185,37 @@ python3 -m pytest tests/test_cli.py -q             # interactive loop + memory
   (Ollama), `OPENAI_API_KEY` / `OPENAI_BASE_URL` (optional external),
   `NEWSAPI_KEY` (future). Never commit real keys; the YAML holds placeholders.
 
+## Connecting in Docker (the CLI ↔ engine link)
+
+The engine `host`/`port` in `config.yaml` is the **connect** address the CLI
+dials — *not* a bind address. `0.0.0.0` is a valid bind for the server but is
+**not** a connect target.
+
+* **CLI in the same container/host as vLLM** → `host: 127.0.0.1` (the default).
+* **CLI in a different container** → point it at the vLLM service. The cleanest
+  way is the env override (no file edit), which wins over `host`/`port`:
+
+  ```bash
+  SPARKS_BASE_URL=http://<vllm-host-or-ip>:8000 python cli.py
+  ```
+
+If a turn prints `Could not reach the <engine> server at …`, the URL in that
+message is exactly what the CLI dialed — fix the host or set `SPARKS_BASE_URL`.
+
+## Logging
+
+Diagnostics go to **stderr** (never stdout), so they never corrupt the chat UI.
+
+```bash
+python cli.py -v                       # DEBUG to stderr (shows the engine URL per request)
+python cli.py --log-level INFO         # or pick a level explicitly
+python cli.py --log-file agent.log     # also tee logs to a file
+SPARKS_LOG_LEVEL=DEBUG python cli.py   # via env
+```
+
+The default level is `WARNING` (quiet). The startup line logs the resolved
+provider, engine, endpoint, and model — handy for confirming where it connects.
+
 ## Future integration points
 
 * **Vector DB / RAG** → `knowledge/vector_db/` (see its README): add

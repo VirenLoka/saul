@@ -26,9 +26,9 @@ def test_run_turn_displays_reasoning_tool_and_answer():
     )
     text = out.getvalue()
     # The reasoning, the tool invocation banner, and the final answer all show.
-    assert "Reasoning:" in text
+    assert "Reasoning" in text
     assert "Invoking MCP tool: get_indian_stock_quote" in text
-    assert "Answer:" in text
+    assert "Answer" in text
     assert "MOCK LLM OUTPUT" in answer
     assert "not financial advice" in answer.lower()
 
@@ -86,4 +86,16 @@ def test_main_once_mode_offline(capsys):
 def test_main_once_mode_no_portfolio(capsys):
     rc = main(["--provider", "mock", "--no-portfolio", "--once", "hi"])
     assert rc == 0
-    assert "Portfolio context: disabled" in capsys.readouterr().out
+    out = capsys.readouterr().out
+    # Banner shows the portfolio row as disabled.
+    assert "Portfolio" in out
+    assert "disabled" in out
+
+
+def test_main_verbose_logs_go_to_stderr_not_stdout(capsys):
+    rc = main(["--provider", "mock", "-v", "--no-portfolio", "--once", "hi"])
+    assert rc == 0
+    captured = capsys.readouterr()
+    # Diagnostic logs must not pollute the chat UI on stdout.
+    assert "Startup |" in captured.err
+    assert "Startup |" not in captured.out
