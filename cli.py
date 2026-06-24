@@ -44,9 +44,23 @@ from config_loader import AppConfig, ConfigError, load_config
 from llm_provider import LLMProvider, get_provider
 from market_data import TOOL_SPECS
 from portfolio_parser import PortfolioParseError, load_portfolio
-from prompts import AGENT_SYSTEM_PROMPT, build_portfolio_context
+from prompts import (
+    ACT_DIRECTIVE,
+    AGENT_SYSTEM_PROMPT,
+    ANSWER_DIRECTIVE,
+    ANSWER_MARKER,
+    PLAN_DIRECTIVE,
+    build_portfolio_context,
+)
+from tool_runtime import InProcessToolExecutor, MCPToolExecutor
 
 logger = logging.getLogger("saul.cli")
+
+# Max tool-execution rounds in the ACT phase before forcing the answer.
+MAX_TOOL_ROUNDS = 4
+
+# Callable that runs a tool: executor(name, arguments_json) -> result_json_string.
+ToolExecutor = object  # documented alias; both executors are plain callables
 
 
 # --------------------------------------------------------------------------- #
@@ -69,6 +83,10 @@ _STYLE = {
     "label": _BOLD + _fg(250),    # row labels
     "value": _fg(252),            # row values
     "muted": _DIM + _fg(245),     # reasoning / hints
+    "plan_hdr": _BOLD + _fg(111),   # plan header (periwinkle)
+    "plan": _fg(111),             # plan body
+    "reflect_hdr": _BOLD + _fg(147),  # reflection header (lavender)
+    "reflect": _DIM + _fg(247),   # reflection body
     "tool": _BOLD + _fg(214),     # tool invocation (amber)
     "result": _fg(80),            # tool result (teal)
     "answer": _fg(255),           # final answer (bright)
@@ -175,7 +193,7 @@ class ConversationMemory:
 # --------------------------------------------------------------------------- #
 class Renderer:
     """Streams events to an output, printing styled section headers as the
-    event type changes."""
+    section changes."""
 
     def __init__(self, out: TextIO, use_color: bool) -> None:
         self.out = out
@@ -191,8 +209,18 @@ class Renderer:
             self._section = section
             self._w("\n" + _style(label, key, self.color) + "\n")
 
+    def plan(self, text: str) -> None:
+        self._header("plan", "🧭 Plan", "plan_hdr")
+        self._w(_style(text, "plan", self.color))
+
     def reasoning(self, text: str) -> None:
         self._header("reasoning", "🧠 Reasoning", "muted")
+        self._w(_style(text, "muted", self.color))
+
+    def working(self, text: str) -> None:
+        if not text.strip():
+            return
+        self._header("working", "⚙️  Working", "muted")
         self._w(_style(text, "muted", self.color))
 
     def tool_call(self, name: str, arguments: str) -> None:
@@ -204,8 +232,12 @@ class Renderer:
         self._section = "tool"
         self._w(_style(f"📊 Tool result [{name}]: {text}", "result", self.color) + "\n")
 
-    def content(self, text: str) -> None:
-        self._header("content", "💬 Answer", "answer_hdr")
+    def reflection(self, text: str) -> None:
+        self._header("reflection", "🔍 Reflection", "reflect_hdr")
+        self._w(_style(text, "reflect", self.color))
+
+    def answer(self, text: str) -> None:
+        self._header("answer", "💬 Answer", "answer_hdr")
         self._w(_style(text, "answer", self.color))
 
     def error(self, text: str) -> None:
@@ -217,73 +249,221 @@ class Renderer:
 
 
 # --------------------------------------------------------------------------- #
-# One conversational turn (factored out so it is unit-testable)
+# Streaming-marker splitter (for splitting REFLECTION from the final ANSWER)
+# --------------------------------------------------------------------------- #
+class _MarkerSplitter:
+    """Splits a streamed text on the first occurrence of ``marker``.
+
+    ``feed`` yields ``(section, text)`` where section is "before" until the
+    marker is seen and "after" thereafter. Handles a marker split across chunk
+    boundaries by retaining a small tail.
+    """
+
+    def __init__(self, marker: str) -> None:
+        self.marker = marker
+        self.buf = ""
+        self.found = False
+
+    def feed(self, text: str) -> List[tuple[str, str]]:
+        if self.found:
+            return [("after", text)] if text else []
+        self.buf += text
+        idx = self.buf.find(self.marker)
+        if idx != -1:
+            out: List[tuple[str, str]] = []
+            before, after = self.buf[:idx], self.buf[idx + len(self.marker):]
+            if before:
+                out.append(("before", before))
+            self.found = True
+            self.buf = ""
+            if after:
+                out.append(("after", after))
+            return out
+        # Marker not yet seen: emit all but a possible partial-marker tail.
+        keep = 0
+        for k in range(1, len(self.marker)):
+            if self.buf.endswith(self.marker[:k]):
+                keep = k
+        emit, self.buf = self.buf[: len(self.buf) - keep], self.buf[len(self.buf) - keep:]
+        return [("before", emit)] if emit else []
+
+    def flush(self) -> List[tuple[str, str]]:
+        if not self.buf:
+            return []
+        section = "after" if self.found else "before"
+        out = [(section, self.buf)]
+        self.buf = ""
+        return out
+
+
+# --------------------------------------------------------------------------- #
+# Phase streaming helpers
+# --------------------------------------------------------------------------- #
+def _stream_phase(
+    provider: LLMProvider,
+    messages: List[Dict[str, object]],
+    tools: Optional[List[Dict[str, object]]],
+    renderer: Renderer,
+    kind: str,
+) -> tuple[List[Dict[str, str]], str, bool]:
+    """Stream one model response. ``kind`` selects how content is rendered:
+    'plan' -> Plan section, 'act' -> Working section. Returns
+    (tool_calls, content_text, had_error)."""
+    calls: List[Dict[str, str]] = []
+    parts: List[str] = []
+    had_error = False
+    for event in provider.stream_chat(messages, tools=tools):
+        if event.type == "reasoning":
+            renderer.reasoning(event.text)
+        elif event.type == "tool_call":
+            logger.info("Tool call: %s(%s)", event.name, event.arguments)
+            renderer.tool_call(event.name, event.arguments)
+            calls.append({"name": event.name, "arguments": event.arguments})
+        elif event.type == "content":
+            parts.append(event.text)
+            if kind == "plan":
+                renderer.plan(event.text)
+            elif kind == "act":
+                renderer.working(event.text)
+        elif event.type == "error":
+            had_error = True
+            logger.error("Stream error: %s", event.text)
+            renderer.error(event.text)
+        elif event.type == "done":
+            break
+    return calls, "".join(parts), had_error
+
+
+def _stream_answer(
+    provider: LLMProvider,
+    messages: List[Dict[str, object]],
+    renderer: Renderer,
+) -> str:
+    """Stream the final phase, splitting REFLECTION from the ANSWER on the
+    ``ANSWER:`` marker. Returns the final user-facing answer text."""
+    splitter = _MarkerSplitter(ANSWER_MARKER)
+    reflection_parts: List[str] = []
+    answer_parts: List[str] = []
+
+    def _route(segments: List[tuple[str, str]]) -> None:
+        for section, text in segments:
+            if section == "before":
+                renderer.reflection(text)
+                reflection_parts.append(text)
+            else:
+                renderer.answer(text)
+                answer_parts.append(text)
+
+    for event in provider.stream_chat(messages, tools=None):
+        if event.type == "reasoning":
+            renderer.reasoning(event.text)
+        elif event.type == "content":
+            _route(splitter.feed(event.text))
+        elif event.type == "error":
+            renderer.error(event.text)
+        elif event.type == "done":
+            break
+    _route(splitter.flush())
+
+    answer = "".join(answer_parts).strip()
+    if not answer:  # model omitted the ANSWER: marker -> treat all of it as the answer
+        answer = "".join(reflection_parts).strip()
+    return answer
+
+
+# --------------------------------------------------------------------------- #
+# One conversational turn: PLAN -> ACT (tool loop) -> REFLECT + ANSWER
 # --------------------------------------------------------------------------- #
 def run_turn(
     provider: LLMProvider,
     memory: ConversationMemory,
     user_input: str,
     tools: Optional[List[Dict[str, object]]] = None,
+    executor: Optional[object] = None,
     out: Optional[TextIO] = None,
     use_color: bool = False,
+    max_tool_rounds: int = MAX_TOOL_ROUNDS,
 ) -> str:
-    """Execute one turn: append user input, stream the response, update memory.
+    """Run one turn through the plan -> act -> reflect loop.
 
-    Returns the final assistant answer text.
+    Reasoning phases (plan, reflection) are displayed but kept ephemeral; only
+    the user message, tool calls/results, and the final answer are committed to
+    long-term memory (keeping the transcript valid and re-sendable). Tools are
+    used only when both ``tools`` and ``executor`` are provided.
     """
     out = out if out is not None else sys.stdout
     memory.append_user(user_input)
     logger.info("Turn %d | user: %s", memory.turn_count(), user_input[:120])
     renderer = Renderer(out, use_color)
 
-    answer_parts: List[str] = []
-    calls: List[Dict[str, str]] = []              # {id, name, arguments}
-    results: List[Dict[str, str]] = []            # {id, name, content}
-    saw_error = False
+    can_use_tools = tools is not None and executor is not None
+    working: List[Dict[str, object]] = list(memory.messages)
 
-    for event in provider.stream_chat(memory.messages, tools=tools):
-        if event.type == "reasoning":
-            renderer.reasoning(event.text)
-        elif event.type == "tool_call":
-            # One complete event per tool (uniform across providers).
-            logger.info("Tool call: %s(%s)", event.name, event.arguments)
-            renderer.tool_call(event.name, event.arguments)
-            calls.append(
+    # ---- PHASE 1: PLAN (no tools) -----------------------------------------
+    _, plan_text, _ = _stream_phase(
+        provider, working + [{"role": "user", "content": PLAN_DIRECTIVE}],
+        None, renderer, "plan",
+    )
+    if plan_text.strip():
+        working.append({"role": "user", "content": PLAN_DIRECTIVE})
+        working.append({"role": "assistant", "content": plan_text})
+
+    # ---- PHASE 2: ACT (tool loop) -----------------------------------------
+    committed_calls: List[Dict[str, str]] = []
+    committed_results: List[Dict[str, str]] = []
+    if can_use_tools:
+        working.append({"role": "user", "content": ACT_DIRECTIVE})
+        for round_i in range(max_tool_rounds):
+            calls, _act_text, had_error = _stream_phase(
+                provider, working, tools, renderer, "act"
+            )
+            if had_error or not calls:
+                break
+            norm: List[Dict[str, str]] = [
+                {"id": memory.next_tool_id(), "name": c["name"], "arguments": c["arguments"]}
+                for c in calls
+            ]
+            working.append(
                 {
-                    "id": memory.next_tool_id(),
-                    "name": event.name,
-                    "arguments": event.arguments,
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [
+                        {
+                            "id": c["id"],
+                            "type": "function",
+                            "function": {"name": c["name"], "arguments": c["arguments"]},
+                        }
+                        for c in norm
+                    ],
                 }
             )
-        elif event.type == "tool_result":
-            logger.debug("Tool result [%s]: %s", event.name, event.text[:200])
-            renderer.tool_result(event.name, event.text)
-            for c in calls:
-                if c["name"] == event.name and not any(r["id"] == c["id"] for r in results):
-                    results.append({"id": c["id"], "name": c["name"], "content": event.text})
-                    break
-        elif event.type == "content":
-            renderer.content(event.text)
-            answer_parts.append(event.text)
-        elif event.type == "error":
-            saw_error = True
-            logger.error("Stream error: %s", event.text)
-            renderer.error(event.text)
-        elif event.type == "done":
-            break
+            committed_calls.extend(norm)
+            for c in norm:
+                result = executor(c["name"], c["arguments"])  # type: ignore[operator]
+                renderer.tool_result(c["name"], result)
+                working.append(
+                    {"role": "tool", "tool_call_id": c["id"], "name": c["name"], "content": result}
+                )
+                committed_results.append({"id": c["id"], "name": c["name"], "content": result})
+        else:
+            logger.warning("Reached max tool rounds (%d); forcing answer.", max_tool_rounds)
 
+    # ---- PHASE 3: REFLECT + ANSWER (no tools) -----------------------------
+    answer = _stream_answer(
+        provider, working + [{"role": "user", "content": ANSWER_DIRECTIVE}], renderer
+    )
     renderer.end_turn()
 
-    # Update memory in canonical order: tool_calls -> tool results -> answer.
-    if calls:
-        memory.append_tool_calls(calls)
-        for r in results:
+    # ---- COMMIT to long-term memory (valid + minimal) ---------------------
+    if committed_calls:
+        memory.append_tool_calls(committed_calls)
+        for r in committed_results:
             memory.append_tool_result(r["id"], r["name"], r["content"])
-
-    answer = "".join(answer_parts)
     memory.append_assistant_text(answer)
-    if not saw_error:
-        logger.debug("Turn complete | answer chars=%d", len(answer))
+    logger.debug(
+        "Turn complete | tool_calls=%d answer chars=%d",
+        len(committed_calls), len(answer),
+    )
     return answer
 
 
@@ -410,13 +590,27 @@ def main(argv: Optional[List[str]] = None, out: Optional[TextIO] = None) -> int:
     provider = get_provider(config)
     memory = ConversationMemory(system_prompt)
 
-    # Only attach MCP tools for engines that execute them server-side
-    # (vLLM --tool-server). Ollama has no equivalent, so it runs tool-free.
+    # Attach MCP tools for tool-capable engines (vLLM, mock). Ollama runs
+    # tool-free. The CLI executes tool calls itself (agentic loop):
+    #   * vllm -> call the live FastMCP server over MCP
+    #   * mock -> run the market_data functions in-process (offline, deterministic)
     tools = TOOL_SPECS if provider.supports_server_side_tools else None
+    executor: Optional[object] = None
     if tools:
-        tools_line = ", ".join(t["function"]["name"] for t in tools)
+        tool_names = ", ".join(t["function"]["name"] for t in tools)
+        if config.model_selection.provider == "mock":
+            executor = InProcessToolExecutor.from_settings(
+                config.mcp.market_data, use_live=False
+            )
+            tools_line = f"{tool_names} (in-process / offline)"
+        else:
+            executor = MCPToolExecutor(
+                config.mcp.tool_server_url,
+                timeout=config.local_inference.request_timeout,
+            )
+            tools_line = f"{tool_names} (via MCP @ {config.mcp.tool_server_url})"
     else:
-        tools_line = "disabled for this engine (no server-side --tool-server)"
+        tools_line = "disabled for this engine (runs tool-free)"
 
     use_color = (not args.no_color) and hasattr(out, "isatty") and out.isatty()
     endpoint = (
@@ -453,7 +647,8 @@ def main(argv: Optional[List[str]] = None, out: Optional[TextIO] = None) -> int:
 
     # Single-shot mode (handy for scripting / smoke tests).
     if args.once is not None:
-        run_turn(provider, memory, args.once, tools=tools, out=out, use_color=use_color)
+        run_turn(provider, memory, args.once, tools=tools, executor=executor,
+                 out=out, use_color=use_color)
         return 0
 
     # Interactive loop.
@@ -492,7 +687,8 @@ def main(argv: Optional[List[str]] = None, out: Optional[TextIO] = None) -> int:
             )
             continue
 
-        run_turn(provider, memory, user_input, tools=tools, out=out, use_color=use_color)
+        run_turn(provider, memory, user_input, tools=tools, executor=executor,
+                 out=out, use_color=use_color)
 
     return 0
 

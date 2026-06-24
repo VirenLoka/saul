@@ -262,35 +262,98 @@ class MockStreamingProvider(LLMProvider):
     name = "mock:offline"
     supports_server_side_tools = True  # simulates the full tool flow for demos/tests
 
+    _PHASE_MARKERS = ("PLANNING STEP", "ACTING STEP", "ANSWER STEP")
+
+    @staticmethod
+    def _emit_text(text: str) -> Iterator[StreamEvent]:
+        # Stream in a few chunks so the renderer exercises incremental writes.
+        for line in text.splitlines(keepends=True):
+            yield StreamEvent(type="content", text=line)
+
     def stream_chat(
         self,
         messages: List[Dict[str, object]],
         tools: Optional[List[Dict[str, object]]] = None,
     ) -> Iterator[StreamEvent]:
-        last_user = ""
+        # Last user message = the phase directive (in the plan/act/reflect loop).
+        directive = ""
         for m in reversed(messages):
             if m.get("role") == "user":
-                last_user = str(m.get("content", ""))
+                directive = str(m.get("content", ""))
                 break
-        text = last_user.lower()
 
-        if "sector" in text or any(s in text for s in ("it sector", "banking", "auto")):
-            tool_name = "get_indian_sector_performance"
-            args = json.dumps({"sector": "IT"})
-        else:
-            tool_name = "get_indian_stock_quote"
-            args = json.dumps({"query": "Reliance", "exchange": "NS"})
+        # Current question = the LATEST user message that is NOT a phase
+        # directive (so multi-turn histories pick the current turn's question).
+        question = ""
+        question_idx = -1
+        for i in range(len(messages) - 1, -1, -1):
+            m = messages[i]
+            if m.get("role") == "user":
+                c = str(m.get("content", ""))
+                if not any(mk in c for mk in self._PHASE_MARKERS):
+                    question = c
+                    question_idx = i
+                    break
 
+        wants_sector = "sector" in question.lower()
+        tool_name = (
+            "get_indian_sector_performance" if wants_sector else "get_indian_stock_quote"
+        )
+        args = (
+            json.dumps({"sector": "IT"})
+            if wants_sector
+            else json.dumps({"query": "Reliance", "exchange": "NS"})
+        )
+        # Only count tool results from the CURRENT turn (after the current
+        # question), so prior turns' tool messages don't end this turn early.
+        has_tool_result = any(
+            m.get("role") == "tool" for m in messages[question_idx + 1:]
+        )
+
+        # ---- PLANNING phase ------------------------------------------------
+        if "PLANNING STEP" in directive:
+            plan = (
+                "[MOCK PLAN]\n"
+                "1. Identify the relevant holding/sector from the portfolio context.\n"
+                f"2. Call {tool_name} to fetch the live figure.\n"
+                "3. Interpret the result and answer."
+            )
+            yield from self._emit_text(plan)
+            yield StreamEvent(type="done", finish_reason="stop")
+            return
+
+        # ---- ACTING phase --------------------------------------------------
+        if "ACTING STEP" in directive:
+            if has_tool_result:
+                # Data already gathered; nothing more to call.
+                yield StreamEvent(type="done", finish_reason="stop")
+                return
+            yield StreamEvent(
+                type="reasoning", text="[MOCK] Calling the tool my plan requires."
+            )
+            yield StreamEvent(type="tool_call", name=tool_name, arguments=args)
+            yield StreamEvent(type="done", finish_reason="tool_calls")
+            return
+
+        # ---- ANSWER (reflect + answer) phase -------------------------------
+        if "ANSWER STEP" in directive:
+            text = (
+                "[MOCK REFLECTION] The (mock) tool data is in hand and is "
+                "consistent with the portfolio context.\n"
+                "ANSWER: [MOCK LLM OUTPUT] Based on the mock tool data, here is the "
+                "deterministic offline answer. This is not financial advice; no "
+                "trades executed."
+            )
+            yield from self._emit_text(text)
+            yield StreamEvent(type="done", finish_reason="stop")
+            return
+
+        # ---- Fallback: single-shot (non-phased) direct call ----------------
         yield StreamEvent(
             type="reasoning",
             text="[MOCK] No model was run. Deciding which MCP tool answers this.",
         )
         yield StreamEvent(type="tool_call", name=tool_name, arguments=args)
-        yield StreamEvent(
-            type="tool_result",
-            name=tool_name,
-            text='{"source": "mock", "note": "deterministic offline result"}',
-        )
         for token in (
             "[MOCK LLM OUTPUT] ",
             "Based on the (mock) tool data, ",

@@ -199,6 +199,13 @@ dials — *not* a bind address. `0.0.0.0` is a valid bind for the server but is
   SPARKS_BASE_URL=http://<vllm-host-or-ip>:8000 python cli.py
   ```
 
+The CLI also connects to the **MCP server** to execute tools (see below).
+If that server is in another container, override its URL too:
+
+```bash
+SPARKS_MCP_URL=http://<mcp-host-or-ip>:8001/sse python cli.py
+```
+
 If a turn prints `Could not reach the <engine> server at …`, the URL in that
 message is exactly what the CLI dialed — fix the host or set `SPARKS_BASE_URL`.
 
@@ -215,6 +222,31 @@ SPARKS_LOG_LEVEL=DEBUG python cli.py   # via env
 
 The default level is `WARNING` (quiet). The startup line logs the resolved
 provider, engine, endpoint, and model — handy for confirming where it connects.
+
+## How a turn works (plan → act → reflect)
+
+Each question runs through a forced reasoning loop so the model thinks before it
+answers, and so tool calls actually complete:
+
+1. **🧭 Plan** — the model first lays out a short numbered plan (no tools). This
+   is shown live and forces chain-of-thought before any answer-from-memory.
+2. **🔧 Act** — the model calls MCP tools to gather live data. *The CLI executes
+   each call against the FastMCP server over the MCP protocol*, prints the
+   result, feeds it back into the conversation, and lets the model call more
+   tools if needed (up to a round cap). This is what makes a tool call resolve
+   into a real answer instead of dead-ending.
+3. **🔍 Reflection → 💬 Answer** — the model reflects on the gathered data, then
+   gives the grounded final answer (split on an `ANSWER:` marker).
+
+Tool execution by engine:
+* **vLLM** → calls the live FastMCP server (`mcp.tool_server_url` / `SPARKS_MCP_URL`).
+* **mock** → runs the `market_data` functions in-process (offline, deterministic).
+* **Ollama** → tool-free: it still plans and answers, but skips the Act phase.
+
+Plan and reflection text are shown but kept out of long-term memory; only the
+user message, tool calls/results, and the final answer are persisted (so the
+transcript stays valid and re-sendable). The cap is `MAX_TOOL_ROUNDS` in
+`cli.py`.
 
 ## Future integration points
 

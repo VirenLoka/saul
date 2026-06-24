@@ -211,9 +211,12 @@ def load_config(
         host=str(mcp_section.get("host", "127.0.0.1")),
         port=int(mcp_section.get("port", 8001)),
         transport=str(mcp_section.get("transport", "sse")).lower(),
-        tool_server_url=str(
-            mcp_section.get("tool_server_url", "http://127.0.0.1:8001/sse")
-        ),
+        # The CLI's MCP client connects here. Env SPARKS_MCP_URL wins, so a
+        # different-container MCP server can be reached without editing the file
+        # (e.g. SPARKS_MCP_URL=http://172.23.0.5:8001/sse). Note this is a full
+        # client URL with scheme + /sse, distinct from vLLM's --tool-server arg.
+        tool_server_url=os.environ.get("SPARKS_MCP_URL", "").strip()
+        or str(mcp_section.get("tool_server_url", "http://127.0.0.1:8001/sse")),
         market_data=MarketDataSettings(
             default_exchange=str(md.get("default_exchange", "NS")).upper(),
             use_live=bool(md.get("use_live", True)),

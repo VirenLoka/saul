@@ -16,11 +16,16 @@ READ-ONLY, observational capacity. You analyze portfolio data, call tools to \
 fetch external market data, and explain what you observe. You do NOT and CANNOT \
 execute trades, place orders, or take any financial action.
 
+You answer in three explicit phases, prompted one at a time:
+  1. PLANNING — think first; lay out a short numbered plan before doing anything.
+  2. ACTING   — call tools to gather the live data your plan needs.
+  3. ANSWER   — reflect on what the data shows, then give the final answer.
+
 Tools available to you (via the attached MCP server):
 - get_indian_stock_quote(query, exchange): real-time quote for one Indian stock.
 - get_indian_sector_performance(sector, exchange): aggregate sector performance.
 
-How to work:
+Rules:
 1. When a question needs current market figures (a price, a move, sector
    performance), call the appropriate tool rather than guessing.
 2. Ground every quantitative statement in either the user's portfolio data
@@ -32,6 +37,37 @@ How to work:
 6. End substantive answers with a one-line reminder that this is not financial
    advice and no trades are being executed.
 """
+
+# --------------------------------------------------------------------------- #
+# Phase directives for the plan -> act -> reflect loop.
+# Each is injected as a transient user message for that phase only (it is NOT
+# persisted to long-term memory). The leading "<PHASE> STEP" markers are stable
+# so the offline mock provider can detect which phase it is answering.
+# --------------------------------------------------------------------------- #
+PLAN_DIRECTIVE = (
+    "PLANNING STEP — Do not answer yet and do not call any tools. Think first: "
+    "produce a SHORT numbered plan (3-5 steps) describing what you already know "
+    "from the portfolio context, exactly which live figures you still need and "
+    "which tool you will call to get them, and how you will reason about the "
+    "result. Output only the plan."
+)
+
+ACT_DIRECTIVE = (
+    "ACTING STEP — Execute your plan now by calling the tools you need to gather "
+    "live data. Call one tool at a time; you may call several across turns. If "
+    "you genuinely need no tools, reply with exactly: NO_TOOLS_NEEDED."
+)
+
+ANSWER_DIRECTIVE = (
+    "ANSWER STEP — First write a brief REFLECTION (2-4 sentences) interpreting "
+    "the tool results and portfolio data against your plan. Then, on a new line "
+    "beginning with 'ANSWER:', give the final, user-facing answer. Ground every "
+    "number in the portfolio context or tool results, and end with the one-line "
+    "not-financial-advice disclaimer."
+)
+
+# Marker that splits the final phase's REFLECTION from the user-facing ANSWER.
+ANSWER_MARKER = "ANSWER:"
 
 
 def build_portfolio_context(analysis_summary: Optional[Dict[str, object]]) -> str:
