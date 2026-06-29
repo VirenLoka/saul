@@ -41,6 +41,7 @@ def build_server(config: "AppConfig | None" = None) -> Any:
 
     cfg = config or load_config()
     md = cfg.mcp.market_data
+    news = cfg.newsapi
 
     mcp = FastMCP(name="indian-market-data")
 
@@ -72,6 +73,32 @@ def build_server(config: "AppConfig | None" = None) -> Any:
             exchange or md.default_exchange,
             use_live=md.use_live,
             cache_ttl_seconds=md.cache_ttl_seconds,
+        )
+
+    @mcp.tool
+    def get_stock_news(query: str, max_articles: int = 0) -> dict:
+        """Fetch recent news articles relevant to a stock's price.
+
+        Returns headlines, sources, dates and summaries so the model can factor
+        recent events and sentiment into its analysis. The NewsAPI key comes
+        from the ``newsapi`` config section (or env NEWSAPI_KEY); without a key,
+        deterministic mock headlines are returned.
+
+        Args:
+            query: Company name (e.g. "Reliance", "TCS") or ticker (e.g. "INFY").
+            max_articles: Optional cap on articles returned. 0 = configured default.
+        """
+        from news_data import get_stock_news as _fetch  # avoid shadowing the tool
+
+        return _fetch(
+            query,
+            api_key=news.api_key,
+            base_url=news.base_url,
+            page_size=max_articles or news.page_size,
+            language=news.language,
+            sort_by=news.sort_by,
+            lookback_days=news.lookback_days,
+            use_live=news.use_live,
         )
 
     return mcp

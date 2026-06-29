@@ -29,6 +29,21 @@ def test_in_process_executes_sector():
     assert "avg_change_pct" in out
 
 
+def test_in_process_executes_stock_news_mock():
+    ex = InProcessToolExecutor(use_live=False)
+    out = json.loads(ex("get_stock_news", '{"query": "Reliance"}'))
+    assert out["company"] == "Reliance Industries"
+    assert out["source"] == "mock"  # offline executor -> deterministic mock
+    assert out["article_count"] >= 1
+    assert out["articles"]
+
+
+def test_in_process_stock_news_respects_max_articles():
+    ex = InProcessToolExecutor(use_live=False)
+    out = json.loads(ex("get_stock_news", '{"query": "TCS", "max_articles": 3}'))
+    assert out["article_count"] == 3
+
+
 def test_in_process_unknown_tool_returns_error():
     ex = InProcessToolExecutor(use_live=False)
     out = json.loads(ex("nope", "{}"))

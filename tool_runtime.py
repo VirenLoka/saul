@@ -22,7 +22,7 @@ import logging
 from typing import TYPE_CHECKING, Union
 
 if TYPE_CHECKING:
-    from config_loader import MarketDataSettings
+    from config_loader import MarketDataSettings, NewsApiSettings
 
 logger = logging.getLogger("saul.tools")
 
@@ -134,19 +134,26 @@ class InProcessToolExecutor:
         default_exchange: str = "NS",
         use_live: bool = False,
         cache_ttl_seconds: int = 60,
+        newsapi: "NewsApiSettings | None" = None,
     ) -> None:
         self.default_exchange = default_exchange
         self.use_live = use_live
         self.cache_ttl_seconds = cache_ttl_seconds
+        self.newsapi = newsapi
 
     @classmethod
     def from_settings(
-        cls, md: "MarketDataSettings", *, use_live: bool | None = None
+        cls,
+        md: "MarketDataSettings",
+        *,
+        use_live: bool | None = None,
+        newsapi: "NewsApiSettings | None" = None,
     ) -> "InProcessToolExecutor":
         return cls(
             default_exchange=md.default_exchange,
             use_live=md.use_live if use_live is None else use_live,
             cache_ttl_seconds=md.cache_ttl_seconds,
+            newsapi=newsapi,
         )
 
     def __call__(self, name: str, arguments: ArgsType) -> str:
@@ -155,6 +162,7 @@ class InProcessToolExecutor:
             get_sector_performance,
             get_stock_quote,
         )
+        from news_data import NewsDataError, get_stock_news
 
         try:
             args = parse_args(arguments)
@@ -177,8 +185,23 @@ class InProcessToolExecutor:
                     use_live=self.use_live,
                     cache_ttl_seconds=self.cache_ttl_seconds,
                 )
+            elif name == "get_stock_news":
+                ns = self.newsapi
+                result = get_stock_news(
+                    args.get("query", ""),
+                    api_key=ns.api_key if ns else "",
+                    base_url=ns.base_url if ns else "https://newsapi.org/v2/everything",
+                    page_size=int(args.get("max_articles") or (ns.page_size if ns else 8)),
+                    language=ns.language if ns else "en",
+                    sort_by=ns.sort_by if ns else "publishedAt",
+                    lookback_days=ns.lookback_days if ns else 7,
+                    # honour both this executor's offline flag and the news config:
+                    # in-process mode is used by the offline mock, so default to mock
+                    # unless live is explicitly enabled on both.
+                    use_live=self.use_live and (ns.use_live if ns else True),
+                )
             else:
                 return _err(f"unknown tool '{name}'")
             return json.dumps(result)
-        except MarketDataError as exc:
+        except (MarketDataError, NewsDataError) as exc:
             return _err(str(exc))

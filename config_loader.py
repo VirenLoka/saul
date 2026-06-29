@@ -95,6 +95,19 @@ class McpSettings:
 
 
 @dataclass(frozen=True)
+class NewsApiSettings:
+    """Settings for the stock-news context provider (NewsAPI)."""
+
+    api_key: str
+    base_url: str
+    page_size: int
+    language: str
+    sort_by: str
+    lookback_days: int
+    use_live: bool
+
+
+@dataclass(frozen=True)
 class ApiCredentials:
     newsapi_key: str
     external_openai_api_key: str
@@ -123,6 +136,7 @@ class AppConfig:
     model_selection: ModelSelection
     local_inference: LocalInferenceSettings
     mcp: McpSettings
+    newsapi: NewsApiSettings
     api_credentials: ApiCredentials
     storage_paths: StoragePaths
     analysis: AnalysisSettings
@@ -235,6 +249,23 @@ def load_config(
         or str(ext.get("base_url", "")),
     )
 
+    # ---- newsapi (optional section; env key wins, then this section, then the
+    # legacy api_credentials.newsapi_key fallback) ---------------------------
+    na = data.get("newsapi", {}) or {}
+    newsapi = NewsApiSettings(
+        api_key=(
+            os.environ.get("NEWSAPI_KEY", "")
+            or str(na.get("api_key", ""))
+            or api_credentials.newsapi_key
+        ),
+        base_url=str(na.get("base_url", "https://newsapi.org/v2/everything")),
+        page_size=int(na.get("page_size", 8)),
+        language=str(na.get("language", "en")),
+        sort_by=str(na.get("sort_by", "publishedAt")),
+        lookback_days=int(na.get("lookback_days", 7)),
+        use_live=bool(na.get("use_live", True)),
+    )
+
     # ---- storage_paths -----------------------------------------------------
     sp = _get_section(data, "storage_paths")
     storage_paths = StoragePaths(
@@ -259,6 +290,7 @@ def load_config(
         model_selection=model_selection,
         local_inference=local_inference,
         mcp=mcp,
+        newsapi=newsapi,
         api_credentials=api_credentials,
         storage_paths=storage_paths,
         analysis=analysis,
@@ -275,4 +307,6 @@ if __name__ == "__main__":  # pragma: no cover - manual sanity check
     print("API key set    :", bool(cfg.local_inference.api_key))
     print("MCP tool server:", cfg.mcp.tool_server_url)
     print("Market live     :", cfg.mcp.market_data.use_live)
+    print("NewsAPI key set :", bool(cfg.newsapi.api_key))
+    print("News live       :", cfg.newsapi.use_live)
     print("Portfolios     :", cfg.storage_paths.portfolios)

@@ -26,6 +26,64 @@ def test_loads_bundled_config_defaults():
     assert cfg.mcp.market_data.default_exchange == "NS"
     assert cfg.storage_paths.default_portfolio.endswith("sample_portfolio.csv")
     assert cfg.analysis.target_allocation["Equity"] == 60
+    # newsapi section is parsed with its documented defaults.
+    assert cfg.newsapi.base_url == "https://newsapi.org/v2/everything"
+    assert cfg.newsapi.page_size == 8
+    assert cfg.newsapi.use_live is True
+
+
+def test_newsapi_section_parsed(tmp_path):
+    cfg_path = _write(
+        tmp_path,
+        """
+        model_selection: {provider: vllm}
+        local_inference_settings: {}
+        mcp: {market_data: {}}
+        storage_paths: {}
+        newsapi:
+          api_key: "from-file"
+          page_size: 3
+          sort_by: relevancy
+          use_live: false
+        """,
+    )
+    cfg = load_config(cfg_path)
+    assert cfg.newsapi.api_key == "from-file"
+    assert cfg.newsapi.page_size == 3
+    assert cfg.newsapi.sort_by == "relevancy"
+    assert cfg.newsapi.use_live is False
+
+
+def test_newsapi_env_key_wins_over_file(tmp_path, monkeypatch):
+    cfg_path = _write(
+        tmp_path,
+        """
+        model_selection: {provider: vllm}
+        local_inference_settings: {}
+        mcp: {market_data: {}}
+        storage_paths: {}
+        newsapi: {api_key: "from-file"}
+        """,
+    )
+    monkeypatch.setenv("NEWSAPI_KEY", "from-env")
+    cfg = load_config(cfg_path)
+    assert cfg.newsapi.api_key == "from-env"
+
+
+def test_newsapi_falls_back_to_legacy_credentials(tmp_path, monkeypatch):
+    monkeypatch.delenv("NEWSAPI_KEY", raising=False)
+    cfg_path = _write(
+        tmp_path,
+        """
+        model_selection: {provider: vllm}
+        local_inference_settings: {}
+        mcp: {market_data: {}}
+        storage_paths: {}
+        api_credentials: {newsapi_key: "legacy-key"}
+        """,
+    )
+    cfg = load_config(cfg_path)
+    assert cfg.newsapi.api_key == "legacy-key"
 
 
 def test_ollama_provider_selects_ollama_block(tmp_path):

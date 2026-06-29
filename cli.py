@@ -43,6 +43,7 @@ from analysis import analyze_portfolio
 from config_loader import AppConfig, ConfigError, load_config
 from llm_provider import LLMProvider, get_provider
 from market_data import TOOL_SPECS
+from news_data import NEWS_TOOL_SPECS
 from portfolio_parser import PortfolioParseError, load_portfolio
 from prompts import (
     ACT_DIRECTIVE,
@@ -594,13 +595,13 @@ def main(argv: Optional[List[str]] = None, out: Optional[TextIO] = None) -> int:
     # tool-free. The CLI executes tool calls itself (agentic loop):
     #   * vllm -> call the live FastMCP server over MCP
     #   * mock -> run the market_data functions in-process (offline, deterministic)
-    tools = TOOL_SPECS if provider.supports_server_side_tools else None
+    tools = (TOOL_SPECS + NEWS_TOOL_SPECS) if provider.supports_server_side_tools else None
     executor: Optional[object] = None
     if tools:
         tool_names = ", ".join(t["function"]["name"] for t in tools)
         if config.model_selection.provider == "mock":
             executor = InProcessToolExecutor.from_settings(
-                config.mcp.market_data, use_live=False
+                config.mcp.market_data, use_live=False, newsapi=config.newsapi
             )
             tools_line = f"{tool_names} (in-process / offline)"
         else:

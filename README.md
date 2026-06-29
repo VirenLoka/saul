@@ -37,17 +37,22 @@ the model can fetch quotes and sector performance server-side during a turn.
                                                             ▼
                                           mcp_server.py  (FastMCP: indian-market-data)
                                                             │
-                                          market_data.py  (yfinance .NS/.BO + mock fallback)
+                                  ┌─────────────────────────┴─────────────────────────┐
+                                  ▼                                                     ▼
+                  market_data.py (yfinance .NS/.BO + mock)        news_data.py (NewsAPI + mock fallback)
 ```
 
 Why this shape:
 * **Config-driven** — no model names, ports, or paths hardcoded; read once via
   `config_loader.py`.
 * **MCP-native tools** — `mcp_server.py` is a standalone server; vLLM executes
-  its tools server-side. Adding tools (RAG, news) never touches the CLI.
-* **Decoupled, testable core** — allocation math (`analysis.py`) and market-data
-  logic (`market_data.py`) are pure Python with no MCP/LLM dependency, so the
-  whole suite runs offline with **no forward passes**.
+  its tools server-side. It exposes a live stock quote, sector performance, and
+  **`get_stock_news`** (recent NewsAPI articles for a stock, fed back to the
+  model as grounding context). Adding tools (RAG, etc.) never touches the CLI.
+* **Decoupled, testable core** — allocation math (`analysis.py`), market-data
+  logic (`market_data.py`), and news logic (`news_data.py`) are pure Python with
+  no MCP/LLM dependency, so the whole suite runs offline with **no forward
+  passes**. The news fetch uses only the standard library (`urllib`).
 * **Uniform stream contract** — `llm_provider.py` normalizes both the real vLLM
   stream and an offline mock into the same `StreamEvent` sequence, so `cli.py`
   and its tests are backend-agnostic.
@@ -56,12 +61,13 @@ Why this shape:
 
 ```
 saul/
-├── config.yaml                 # model_selection, local_inference_settings,
-│                               #   mcp, api_credentials, storage_paths, analysis
+├── config.yaml                 # model_selection, local_inference_settings, mcp,
+│                               #   newsapi, api_credentials, storage_paths, analysis
 ├── config_loader.py            # parse YAML -> typed, immutable AppConfig
 ├── portfolio_parser.py         # decoupled CSV -> validated Portfolio
 ├── market_data.py              # Indian market core (yfinance + mock) + tool schemas
-├── mcp_server.py               # FastMCP server wrapping the market-data tools
+├── news_data.py                # stock-news core (NewsAPI + mock) + tool schema
+├── mcp_server.py               # FastMCP server wrapping the market-data + news tools
 ├── llm_provider.py             # OpenAI-compatible streaming client to vLLM + mock
 ├── analysis.py                 # deterministic allocation / drift / concentration
 ├── prompts.py                  # agent system prompt + portfolio context builder
@@ -82,6 +88,7 @@ saul/
     ├── test_portfolio_parser.py
     ├── test_analysis.py
     ├── test_market_data.py     # mocked yfinance — no network
+    ├── test_news_data.py       # mocked NewsAPI — no network
     ├── test_llm_provider.py    # factory + mock stream contract — no model
     └── test_cli.py             # full loop via mock provider — no forward pass
 ```
@@ -119,6 +126,9 @@ pip install "vllm>=0.6.0"          # serving host only
 
 # Shared bearer token (CLI + vLLM must agree)
 export SPARKS_API_KEY="$(openssl rand -hex 32)"
+
+# NewsAPI key for the get_stock_news tool (optional; mock headlines without it)
+export NEWSAPI_KEY="your-newsapi-key"   # or set newsapi.api_key in config.yaml
 
 # --- Terminal 1: MCP tool server (SSE on 127.0.0.1:8001 per config.yaml) -----
 python mcp_server.py
@@ -168,7 +178,7 @@ The suite uses the mock provider and mocked market data — no model inference a
 no live network:
 
 ```bash
-python3 -m pytest -q          # 40 tests
+python3 -m pytest -q          # 64 tests
 python3 -m pytest tests/test_market_data.py -q     # market tool logic only
 python3 -m pytest tests/test_cli.py -q             # interactive loop + memory
 ```
@@ -181,9 +191,16 @@ python3 -m pytest tests/test_cli.py -q             # interactive loop + memory
   resolves the block matching the active provider.
 * MCP: `mcp.{host,port,transport,tool_server_url}` and
   `mcp.market_data.{default_exchange,use_live,cache_ttl_seconds}`.
+* News: `newsapi.{api_key,base_url,page_size,language,sort_by,lookback_days,use_live}`
+  drives the `get_stock_news` tool. With no key (or a failed fetch) it returns
+  deterministic mock headlines, so the pipeline still runs offline.
+* Output length: `local_inference_settings.max_tokens` (default `4096`) caps the
+  answer budget; the agent prompt asks for an in-depth, multi-section report
+  rather than a few lines.
 * Secrets are read from env first — `SPARKS_API_KEY` (vLLM), `OLLAMA_API_KEY`
   (Ollama), `OPENAI_API_KEY` / `OPENAI_BASE_URL` (optional external),
-  `NEWSAPI_KEY` (future). Never commit real keys; the YAML holds placeholders.
+  `NEWSAPI_KEY` (NewsAPI; wins over `newsapi.api_key`). Never commit real keys;
+  the YAML holds placeholders.
 
 ## Connecting in Docker (the CLI ↔ engine link)
 
@@ -253,5 +270,7 @@ transcript stays valid and re-sendable). The cap is `MAX_TOOL_ROUNDS` in
 * **Vector DB / RAG** → `knowledge/vector_db/` (see its README): add
   `vector_store.py`, persist to `storage_paths.vector_db`, expose retrieval as
   another MCP tool and/or inject into the system context.
-* **Real-time news** → `knowledge/market_data/` (see its README): add NewsAPI /
-  scraper fetchers and surface them as new MCP tools in `mcp_server.py`.
+* **Real-time news** → ✅ implemented: `news_data.py` fetches NewsAPI articles
+  for a stock and `mcp_server.py` exposes them as the `get_stock_news` MCP tool
+  (configure under the `newsapi` section). Cache payloads to
+  `knowledge/market_data/` if you want to persist them.

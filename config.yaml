@@ -32,7 +32,8 @@ model_selection:
 local_inference_settings:
   # Shared across whichever engine is active:
   temperature: 0.2
-  max_tokens: 1024
+  max_tokens: 4096          # generous output budget so answers are long &
+                            # in-depth, not a few lines (see prompts.py).
   request_timeout: 180
   stream: true           # stream tokens so the CLI can show live reasoning/tools
 
@@ -71,12 +72,31 @@ mcp:
     cache_ttl_seconds: 60    # in-process quote cache to avoid hammering the API
 
 # -----------------------------------------------------------------------------
+# newsapi
+#   Stock-news context provider. The `get_stock_news` MCP tool fetches recent
+#   articles relevant to a stock's price from NewsAPI
+#   (https://newsapi.org/v2/everything) and feeds them back to the model as
+#   grounding context. Supply the key here or via env NEWSAPI_KEY (env wins).
+#   When no key is set — or a live fetch fails — the tool degrades to
+#   deterministic mock headlines so the pipeline still works offline.
+# -----------------------------------------------------------------------------
+newsapi:
+  api_key: ""                              # or env NEWSAPI_KEY (preferred)
+  base_url: "https://newsapi.org/v2/everything"
+  page_size: 8                             # max articles returned as context
+  language: "en"
+  sort_by: "publishedAt"                   # relevancy | popularity | publishedAt
+  lookback_days: 7                         # search window (days back from today)
+  use_live: true                           # true -> real NewsAPI; false -> mock
+
+# -----------------------------------------------------------------------------
 # api_credentials
 #   PLACEHOLDERS ONLY. Never commit real secrets. Supply via environment
 #   variables; the loader prefers env vars over file values.
 # -----------------------------------------------------------------------------
 api_credentials:
-  newsapi_key: ""          # or env NEWSAPI_KEY (future: knowledge/market_data ingestion)
+  newsapi_key: ""          # deprecated: prefer the `newsapi` section above. Kept
+                           # as a fallback; env NEWSAPI_KEY still wins over both.
   external_openai:         # optional non-vLLM OpenAI-compatible fallback
     api_key: ""            # or env OPENAI_API_KEY
     base_url: ""           # or env OPENAI_BASE_URL
