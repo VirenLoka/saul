@@ -22,9 +22,11 @@ dist/
 *.egg-info/
 
 # --- Configuration secrets ----------------------------------------------------
-# Never commit real credentials. Keep the committed config.yaml as a template
-# with empty placeholders; put real values in an untracked local override or
-# environment variables.
+# Never commit real credentials. config.yaml holds the live API keys and is
+# therefore UNTRACKED; config.example.yaml is the committed placeholder-only
+# template (cp config.example.yaml config.yaml to get started). Prefer env vars
+# — the loader reads them ahead of any file value.
+config.yaml
 .env
 .env.*
 *.secret
@@ -32,6 +34,12 @@ dist/
 secrets.yaml
 config.local.yaml
 config.*.local.yaml
+
+# Scratch notebooks: they accumulate hardcoded keys in cell source/outputs
+# (test_note.ipynb currently embeds a live DeepSeek key), so keep them local.
+# Prefer reading credentials from config.yaml / env vars inside notebooks too.
+*.ipynb
+.ipynb_checkpoints/
 
 # --- Local data caches --------------------------------------------------------
 .cache/
@@ -56,11 +64,15 @@ knowledge/market_data/*
 !knowledge/market_data/README.md
 *.log
 
-# Portfolios: ignore real customer files; keep the sample + docs.
+# Portfolios: ignore real customer files; keep the samples + docs.
 knowledge/portfolios/*
 !knowledge/portfolios/.gitkeep
 !knowledge/portfolios/README.md
 !knowledge/portfolios/sample_portfolio.csv
+!knowledge/portfolios/banking_portfolio.csv
+
+# Backtest outputs (generated equity curves + reports).
+backtesting/results/
 
 # --- OS / editor noise --------------------------------------------------------
 .DS_Store

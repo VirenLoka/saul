@@ -61,7 +61,9 @@ Why this shape:
 
 ```
 saul/
-├── config.yaml                 # model_selection, local_inference_settings, mcp,
+├── config.example.yaml         # committed TEMPLATE (no secrets) — cp to config.yaml
+├── config.yaml                 # YOUR live config + keys; gitignored, never committed
+│                               #   model_selection, local_inference_settings, mcp,
 │                               #   newsapi, api_credentials, storage_paths, analysis
 ├── config_loader.py            # parse YAML -> typed, immutable AppConfig
 ├── portfolio_parser.py         # decoupled CSV -> validated Portfolio
@@ -93,25 +95,32 @@ saul/
     └── test_cli.py             # full loop via mock provider — no forward pass
 ```
 
-## Choosing an engine: vLLM or Ollama
+## Choosing an engine: vLLM or Groq
 
-Switch the local engine with one config value — `model_selection.provider`
-(`vllm` | `ollama` | `mock`) — and launch the matching engine via
-`SPARKS_ENGINE` in `serve.sh`. Both speak the OpenAI-compatible chat API, so the
-client code is identical. The one difference:
+Switch the engine with one config value — `model_selection.provider`
+(`vllm` | `groq` | `mock`). All three speak the OpenAI-compatible chat API, so
+the client code is identical. They differ in where they run and how tools are
+executed:
 
-| | vLLM | Ollama |
-|---|------|--------|
-| Endpoint | `http://127.0.0.1:8000/v1` | `http://127.0.0.1:11434/v1` |
-| Model id | `Qwen/Qwen2.5-7B-Instruct` (HF) | `qwen2.5:7b-instruct` (tag) |
-| API key | `SPARKS_API_KEY` (required) | `OLLAMA_API_KEY` (usually unused) |
-| **MCP tools** | **server-side via `--tool-server`** | **none** — runs tool-free |
+| | vLLM | Groq |
+|---|------|------|
+| Runs | self-hosted (**needs a CUDA GPU**) | remote API |
+| Endpoint | `http://127.0.0.1:8000/v1` | `https://api.groq.com/openai/v1` |
+| Model id | any HF repo id, incl. DeepSeek | Groq-hosted model id |
+| API key | `SPARKS_API_KEY` (required) | `GROQ_API_KEY` |
+| **MCP tools** | **server-side via `--tool-server`** | client-side (in-process) |
 
-> Ollama has no `--tool-server`, so the live MCP market-data tools are not
-> executed server-side in Ollama mode. The CLI detects this (via the provider's
-> `supports_server_side_tools` flag), runs the engine tool-free, and still feeds
-> it the customer portfolio analysis in the system context. Use vLLM for the
-> full live-tool experience.
+> **vLLM is the only self-hosting path**, and the way DeepSeek models are served
+> — point `local_inference_settings.vllm.model` at a DeepSeek repo id (e.g.
+> `deepseek-ai/DeepSeek-R1-Distill-Qwen-7B`) and launch it with `serve.sh` on a
+> GPU host. There is no remote DeepSeek API client.
+>
+> A remote API can't reach a local `--tool-server`, so under `groq` the CLI
+> executes tool calls itself in-process (the provider's
+> `supports_server_side_tools` flag is what selects the executor). Both engines
+> get the full tool suite; only the execution site differs.
+
+Use `mock` to exercise the whole pipeline offline, with no GPU and no API key.
 
 ## Execution — vLLM (full MCP tools)
 
@@ -134,18 +143,25 @@ export NEWSAPI_KEY="your-newsapi-key"   # or set newsapi.api_key in config.yaml
 python mcp_server.py
 
 # --- Terminal 2: vLLM engine with the MCP server attached --------------------
-SPARKS_ENGINE=vllm bash serve.sh
+# Serves Qwen by default; export SPARKS_MODEL=deepseek-ai/DeepSeek-R1-Distill-Qwen-7B
+# (plus SPARKS_TOOL_PARSER=deepseek_v3) to serve DeepSeek instead.
+bash serve.sh
 
 # --- Terminal 3: the interactive agent ---------------------------------------
 python cli.py                       # config: model_selection.provider: vllm
 ```
 
-## Execution — Ollama (no GPU / no MCP tools)
+## Execution — Groq (no GPU, remote API)
 
 ```bash
-# config.yaml: set model_selection.provider: ollama   (or pass --provider ollama)
-SPARKS_ENGINE=ollama bash serve.sh  # pulls qwen2.5:7b-instruct, starts the daemon
-python cli.py --provider ollama
+export GROQ_API_KEY="your-groq-key"   # or set local_inference_settings.groq.api_key
+python cli.py --provider groq         # tools run client-side; mcp_server.py not needed
+```
+
+## Execution — offline (no GPU, no API key)
+
+```bash
+python cli.py --provider mock         # deterministic stub; runs no model
 ```
 
 Example session:
@@ -178,18 +194,24 @@ The suite uses the mock provider and mocked market data — no model inference a
 no live network:
 
 ```bash
-python3 -m pytest -q          # 64 tests
+python3 -m pytest -q          # 191 tests
 python3 -m pytest tests/test_market_data.py -q     # market tool logic only
 python3 -m pytest tests/test_cli.py -q             # interactive loop + memory
 ```
 
 ## Configuration & secrets
 
-* `model_selection.provider`: `vllm` (default), `ollama`, or `mock`.
-* Engine connection: `local_inference_settings.{vllm,ollama}.{model,host,port,api_key}`
-  plus shared `{temperature,max_tokens,request_timeout,stream}`. The loader
-  resolves the block matching the active provider.
-* MCP: `mcp.{host,port,transport,tool_server_url}` and
+* `model_selection.provider`: `vllm`, `groq`, or `mock`. `vllm` is the only
+  self-hosting path (and how DeepSeek is served); `groq` is a remote
+  OpenAI-compatible API whose tools run **client-side** (in-process, live data)
+  since a remote API can't reach a local `--tool-server`.
+* Engine connection: `local_inference_settings.vllm.{model,host,port,api_key}`
+  (Groq uses `groq.{model,base_url,api_key}`) plus shared
+  `{temperature,max_tokens,request_timeout,stream}`. The loader resolves the
+  block matching the active provider.
+* Search: `search.{base_url,max_results,language,use_live}` drives the
+  autonomous `web_search` tool (SearXNG at `http://localhost:8080` by default).
+* MCP: `mcp.{host,port,transport,tllool_server_url}` and
   `mcp.market_data.{default_exchange,use_live,cache_ttl_seconds}`.
 * News: `newsapi.{api_key,base_url,page_size,language,sort_by,lookback_days,use_live}`
   drives the `get_stock_news` tool. With no key (or a failed fetch) it returns
@@ -197,10 +219,42 @@ python3 -m pytest tests/test_cli.py -q             # interactive loop + memory
 * Output length: `local_inference_settings.max_tokens` (default `4096`) caps the
   answer budget; the agent prompt asks for an in-depth, multi-section report
   rather than a few lines.
-* Secrets are read from env first — `SPARKS_API_KEY` (vLLM), `OLLAMA_API_KEY`
-  (Ollama), `OPENAI_API_KEY` / `OPENAI_BASE_URL` (optional external),
-  `NEWSAPI_KEY` (NewsAPI; wins over `newsapi.api_key`). Never commit real keys;
-  the YAML holds placeholders.
+* Rate-limit / size guards (`local_inference_settings`): remote tiers cap tokens
+  per request/minute (Groq's free tier is 8000 TPM). To avoid HTTP 413s and the
+  429 retry loop they trigger, the client (a) truncates each tool result fed
+  back to the model to `max_tool_result_chars`, (b) trims old history and clamps
+  `max_tokens` so prompt + completion stays under `max_request_tokens` (set
+  *below* the hard limit, e.g. `7000`; `0` disables — use `0` for self-hosted
+  vLLM, which has no such cap), and (c) bounds the client's auto-retries with
+  `request_max_retries`. On an unrecoverable rate-limit/size/auth error the CLI
+  **aborts the turn** instead of cascading the failure through the next phase.
+### Where credentials live
+
+**`config.yaml` is gitignored and is the only file that holds real keys.**
+`config.example.yaml` is the committed, placeholder-only template — the app
+never reads it. First-time setup:
+
+```bash
+cp config.example.yaml config.yaml   # then fill in your keys in config.yaml
+```
+
+This makes a key leak structurally impossible via `git add`: the file carrying
+the secrets simply isn't tracked. When you add or rename a setting, mirror it
+into `config.example.yaml` (minus the secret) so the template stays complete.
+
+Every key is also readable from the environment, which **wins over any file
+value**:
+
+| Env var | Used for |
+|---|---|
+| `SPARKS_API_KEY` | vLLM bearer token (must match `serve.sh`) |
+| `GROQ_API_KEY` | remote Groq API |
+| `NEWSAPI_KEY` | NewsAPI (wins over `newsapi.api_key`) |
+| `NEWSDATA_API_KEY` | newsdata.io archive news (backtesting) |
+
+> Scratch notebooks (`*.ipynb`) are gitignored too — they tend to accumulate
+> hardcoded keys in cell source and outputs. Read credentials from
+> `config_loader.load_config()` inside notebooks rather than pasting them in.
 
 ## Connecting in Docker (the CLI ↔ engine link)
 
@@ -257,19 +311,142 @@ answers, and so tool calls actually complete:
 
 Tool execution by engine:
 * **vLLM** → calls the live FastMCP server (`mcp.tool_server_url` / `SPARKS_MCP_URL`).
+* **Groq** → runs the tools in-process against live data (a remote API can't
+  reach a local `--tool-server`).
 * **mock** → runs the `market_data` functions in-process (offline, deterministic).
-* **Ollama** → tool-free: it still plans and answers, but skips the Act phase.
 
 Plan and reflection text are shown but kept out of long-term memory; only the
 user message, tool calls/results, and the final answer are persisted (so the
 transcript stays valid and re-sendable). The cap is `MAX_TOOL_ROUNDS` in
 `cli.py`.
 
+## Analytics, web search & knowledge graphs
+
+Beyond quotes/sector/news, the MCP server exposes (all with a deterministic
+mock fallback, so the whole surface runs offline):
+
+* **Statistical metrics** (`stock_stats.py`) — `get_return_statistics`
+  (returns/vol/Sharpe/Sortino/drawdown/VaR), `get_technical_indicators`
+  (SMA/EMA/RSI/MACD/Bollinger/momentum), `get_risk_metrics` (beta, Jensen's
+  alpha, correlation, tracking error vs `^NSEI`), `get_correlation_matrix`, and
+  `get_stock_fundamentals`. All derive from the same yfinance history path used
+  by the quote tool.
+* **Autonomous web search** (`web_search.py`) — `web_search` hits a self-hosted
+  **SearXNG** instance (`curl "$SEARXNG/search?q=…&format=json"`), configured
+  under `search:`. The model calls it on its own when external facts help.
+* **Knowledge graphs** (`sector_graph.py`, `graph_agent.py`, `graph_viz.py`) —
+  `build_sector_graph(sectors)` and `build_portfolio_graph()` create a graph
+  whose **nodes** are tickers carrying alpha factors, indicators, fundamentals,
+  sentiment (news lexicon) and filings features (a `FilingsProvider` ABC — no
+  filings backend exists yet, so it returns an explicit placeholder). **Edges**
+  are associations seeded with quantitative evidence, then confirmed through
+  repeated reason/reflect passes (`propose_graph_edge` / `validate_graph_edge`;
+  an edge needs `min_validations` confirms and one reject drops it). The
+  portfolio builder runs this loop autonomously — **LLM-driven** when a live
+  provider is attached, with a **deterministic evidence heuristic** fallback so
+  it works with no model/GPU. Graphs **persist** to `storage_paths.graphs`
+  (`knowledge/market_data/graphs/*.json`) so `list_saved_graphs` and
+  `get_sector_graph` can query them in a later session — or `get_all_graphs`
+  pulls **every** persisted graph at once with a cross-graph index (which graphs
+  each ticker is in + the union of validated associations) for reasoning across
+  the whole collection. `visualize_sector_graph` renders **Graphviz DOT** (plus
+  an SVG if the `dot` binary is present) to eyeball the model's reasoning.
+* **Portfolio construction — two steps, the LLM decides** (`portfolio_builder.py`).
+  The allocation decision belongs to the reasoning model, not to Python:
+  1. `fetch_sector_analytics(sectors)` reads only — it returns raw per-stock
+     metrics (volatility, P/E, Sharpe, return, price) and sizes nothing.
+  2. The model reasons over those metrics (dropping/shrinking negative-Sharpe
+     names) and passes its chosen `ticker_weights` to
+     `generate_final_portfolio(ticker_weights, total_amount, reasoning)`, which
+     does only the mechanical work: sizes each position, **rounds down to whole
+     shares**, and writes the **CSV** plus a **reasoning** markdown file holding
+     the model's own rationale + the share math. Weights are literal fractions
+     of capital — summing to <1 leaves the remainder as cash. A deterministic
+     `compute_baseline_weights` exists purely as an offline/mock fallback.
+* **Portfolios** — `sample_portfolio.csv` (diversified) and
+  `banking_portfolio.csv` (an n-ticker Indian-banking book) live under
+  `knowledge/portfolios/`; the banking universe in `market_data.py` was expanded
+  to ~12 names to back it.
+
+## Standalone scripts (outside the chat CLI)
+
+Two entry points drive the pipeline without the interactive loop:
+
+```bash
+# 1. Build a graph, run the reason/reflect validation loop, persist + visualize.
+python run_graph_reasoning.py --sectors it,banking --mock          # offline
+python run_graph_reasoning.py --portfolio knowledge/portfolios/banking_portfolio.csv
+python run_graph_reasoning.py --sectors it,banking --llm --provider groq  # LLM-driven
+
+# 2. Have the configured LLM construct a diversified portfolio: it calls
+#    fetch_sector_analytics, decides the weights itself, then calls
+#    generate_final_portfolio (writes CSV + reasoning under storage_paths.portfolios).
+python generate_portfolio.py --provider groq --amount 1000000 --risk balanced
+python generate_portfolio.py --provider mock --mock                # offline fallback
+```
+
+```bash
+# 3. Build a POINT-IN-TIME user-portfolio graph as of a past date (after the
+#    training cutoff): nodes = tickers with as-of stats + newsdata.io archive
+#    news + sentiment; the LLM validates the associations over that snapshot.
+python run_portfolio_graph_asof.py --mock                                    # offline
+python run_portfolio_graph_asof.py --provider groq --start 2025-08-08 --end 2025-09-08
+```
+
+`run_portfolio_graph_asof.py` (config: `portfolio_graph:`) builds a graph over a
+user's portfolio *as of a historical window* (default start `2025-08-08`). Node
+features are **point-in-time** statistical metrics (return/vol/Sharpe/momentum/
+drawdown from a trailing window ending at the chosen date — no look-ahead, via
+the backtest price matrix) plus **newsdata.io archive** articles for the window
+with a sentiment score. The LLM then runs the reason/reflect loop over that
+snapshot (its node digests carry the as-of stats + recent headlines). `web_search`
+is deliberately **off** — its present-day results would be look-ahead relative to
+the historical graph. Runs fully offline with `--mock`.
+
+`run_graph_reasoning.py` persists graphs to `storage_paths.graphs`, renders a DOT
+(+ image if Graphviz is installed), and **streams the model's edge-validation
+output live** (token-by-token under `--llm`). It **excludes the sentiment node
+feature by default** (deferred; `--sentiment` re-enables it). `generate_portfolio.py`
+runs the two-step flow with the full data/analytics/search tool suite available on
+demand (live quotes, news, statistics, `web_search`), streaming all model output;
+if no model finalizes a portfolio (e.g. the offline `mock` provider) it falls back
+to a deterministic baseline so it always produces output.
+
+## Backtesting (`backtesting/`)
+
+A periodic-rebalancing market simulation that drives the portfolio flow over a
+historical window and marks it to market vs a benchmark (`^NSEI`). Config lives
+in the `backtesting:` + `newsdata:` sections; flags override.
+
+```bash
+python -m backtesting.runner --mock                  # offline, deterministic baseline
+python -m backtesting.runner --provider groq         # LLM chooses weights each rebalance
+python -m backtesting.runner --provider groq --graph-id <id> --rebalance monthly
+```
+
+At each rebalance the engine (`backtesting/engine.py`) computes **point-in-time**
+analytics (trailing return/vol/Sharpe — no look-ahead), fetches **archive news**
+for the preceding window via **newsdata.io** (`backtesting/news_archive.py`,
+`fetch_news_archive` tool), attaches **knowledge-graph peer context** (from a
+graph built with sentiment excluded), and lets the **LLM choose the weights**
+(deterministic baseline fallback offline / on rate-limit). It sizes at that
+date's prices, holds to the next rebalance, and writes an equity-curve CSV + a
+markdown report to `backtesting.results_dir`.
+
+Guardrails baked in: **`web_search` is disabled during backtesting**, and the
+window start + every news read are **clamped to `newsdata.earliest_date`**
+(default `2025-08-05`, the model's training cutoff) so the backtest can't read
+anything from before the cutoff. Runs fully offline with `--mock` (mock prices +
+deterministic weights, no model/GPU/network).
+
 ## Future integration points
 
 * **Vector DB / RAG** → `knowledge/vector_db/` (see its README): add
   `vector_store.py`, persist to `storage_paths.vector_db`, expose retrieval as
   another MCP tool and/or inject into the system context.
+* **Financial filings** → implement the `FilingsProvider` ABC in
+  `sector_graph.py` against EDGAR / NSE corporate filings and pass it to
+  `build_sector_graph`; nodes will then carry filings features automatically.
 * **Real-time news** → ✅ implemented: `news_data.py` fetches NewsAPI articles
   for a stock and `mcp_server.py` exposes them as the `get_stock_news` MCP tool
   (configure under the `newsapi` section). Cache payloads to

@@ -16,8 +16,12 @@ def _write(tmp_path, text: str):
 
 
 def test_loads_bundled_config_defaults():
-    """The repo's own config.yaml should default to vLLM + Qwen."""
-    cfg = load_config()
+    """With vLLM selected, the bundled config resolves the vLLM + Qwen block.
+
+    Provider is pinned explicitly so this is independent of whichever provider
+    happens to be active in the working-copy config.yaml.
+    """
+    cfg = load_config(provider_override="vllm")
     assert cfg.model_selection.provider == "vllm"
     assert cfg.local_inference.engine == "vllm"
     assert cfg.local_inference.model == "Qwen/Qwen2.5-7B-Instruct"
@@ -86,23 +90,46 @@ def test_newsapi_falls_back_to_legacy_credentials(tmp_path, monkeypatch):
     assert cfg.newsapi.api_key == "legacy-key"
 
 
-def test_ollama_provider_selects_ollama_block(tmp_path):
-    """Switching provider to ollama resolves the ollama connection block."""
+def test_groq_provider_selects_groq_block(tmp_path):
+    """Switching provider to groq resolves the groq connection block."""
     cfg_path = _write(
         tmp_path,
         """
-        model_selection: {provider: ollama}
+        model_selection: {provider: groq}
         local_inference_settings:
           vllm: {model: "Qwen/Qwen2.5-7B-Instruct", port: 8000}
-          ollama: {model: "qwen2.5:7b-instruct", port: 11434}
+          groq: {model: "openai/gpt-oss-20b", base_url: "https://api.groq.com/openai/v1"}
         mcp: {market_data: {}}
         storage_paths: {}
         """,
     )
     cfg = load_config(cfg_path)
-    assert cfg.local_inference.engine == "ollama"
-    assert cfg.local_inference.model == "qwen2.5:7b-instruct"
-    assert cfg.local_inference.openai_base_url == "http://127.0.0.1:11434/v1"
+    assert cfg.local_inference.engine == "groq"
+    assert cfg.local_inference.model == "openai/gpt-oss-20b"
+    assert cfg.local_inference.openai_base_url == "https://api.groq.com/openai/v1"
+
+
+def test_vllm_serves_deepseek_model(tmp_path):
+    """DeepSeek is reached by pointing the self-hosted vLLM block at its repo id.
+
+    Guards the item-4 contract: there is no deepseek provider, so a DeepSeek
+    model must resolve through vllm and be dialled at the local host:port.
+    """
+    cfg_path = _write(
+        tmp_path,
+        """
+        model_selection: {provider: vllm}
+        local_inference_settings:
+          vllm: {model: "deepseek-ai/DeepSeek-R1-Distill-Qwen-7B", port: 8000}
+        mcp: {market_data: {}}
+        storage_paths: {}
+        """,
+    )
+    cfg = load_config(cfg_path)
+    assert cfg.local_inference.engine == "vllm"
+    assert cfg.local_inference.model == "deepseek-ai/DeepSeek-R1-Distill-Qwen-7B"
+    # Self-hosted: a local endpoint, never api.deepseek.com.
+    assert cfg.local_inference.openai_base_url == "http://127.0.0.1:8000/v1"
 
 
 def test_env_var_overrides_vllm_api_key(tmp_path, monkeypatch):
@@ -121,20 +148,20 @@ def test_env_var_overrides_vllm_api_key(tmp_path, monkeypatch):
     assert cfg.local_inference.api_key == "from-env"
 
 
-def test_env_var_overrides_ollama_api_key(tmp_path, monkeypatch):
+def test_env_var_overrides_groq_api_key(tmp_path, monkeypatch):
     cfg_path = _write(
         tmp_path,
         """
-        model_selection: {provider: ollama}
+        model_selection: {provider: groq}
         local_inference_settings:
-          ollama: {api_key: "from-file"}
+          groq: {api_key: "from-file"}
         mcp: {market_data: {}}
         storage_paths: {}
         """,
     )
-    monkeypatch.setenv("OLLAMA_API_KEY", "ollama-env")
+    monkeypatch.setenv("GROQ_API_KEY", "groq-env")
     cfg = load_config(cfg_path)
-    assert cfg.local_inference.api_key == "ollama-env"
+    assert cfg.local_inference.api_key == "groq-env"
 
 
 def test_invalid_provider_raises(tmp_path):

@@ -1,0 +1,239 @@
+# =============================================================================
+# MCP-Powered Financial Advisor AI Agent — Configuration TEMPLATE
+# =============================================================================
+# THIS is the committed template. The app does NOT read this file; it reads
+# config.yaml, which is gitignored so real credentials can never be pushed.
+#
+#   First-time setup:   cp config.example.yaml config.yaml
+#                       # then fill in your keys in config.yaml
+#
+# Every api_key here is intentionally empty. Keep it that way: if you put a real
+# key in this file, committing it publishes it. Prefer environment variables —
+# the loader reads them FIRST, ahead of any file value:
+#   SPARKS_API_KEY (vLLM) · GROQ_API_KEY · NEWSAPI_KEY · NEWSDATA_API_KEY
+#
+# When you add or rename a setting in config.yaml, mirror it here (minus the
+# secret) so the template stays a complete, working starting point.
+#
+# All runtime behavior is driven by this file. Source code must not hardcode
+# model names, ports, or credentials. Edit values here; the application reads
+# them at startup via config_loader.py.
+# -----------------------------------------------------------------------------
+
+# -----------------------------------------------------------------------------
+# model_selection
+#   provider: which LLM engine the CLI talks to. Every supported engine speaks
+#   the OpenAI-compatible chat API, so switching is just this one value.
+#     - vllm  -> SELF-HOSTED vLLM server (see serve.sh). The only self-hosting
+#                path; supports server-side MCP tools via --tool-server. This is
+#                how DeepSeek models are served (set the vllm.model below to a
+#                DeepSeek repo id) — there is no remote DeepSeek API client.
+#     - groq  -> remote Groq API (OpenAI-compatible, fast LPU inference). Tools
+#                run CLIENT-SIDE (the CLI executes them in-process), since a
+#                remote API cannot reach a local --tool-server.
+#     - mock  -> deterministic offline stub (no network; used for tests/CI)
+# -----------------------------------------------------------------------------
+model_selection:
+  provider: groq           # vllm | groq | mock
+
+# -----------------------------------------------------------------------------
+# local_inference_settings
+#   Shared sampling/streaming knobs plus a per-engine connection block. The
+#   loader reads the block matching model_selection.provider and exposes it as
+#   the active engine. Each engine exposes an OpenAI-compatible endpoint at
+#   <base_url>/v1. API keys are read from the environment first:
+#     - vLLM -> SPARKS_API_KEY  (bearer token; required by serve.sh)
+#     - Groq -> GROQ_API_KEY
+# -----------------------------------------------------------------------------
+local_inference_settings:
+  # Shared across whichever engine is active:
+  temperature: 0.2
+  max_tokens: 4096          # generous output budget so answers are long &
+                            # in-depth, not a few lines (see prompts.py).
+  request_timeout: 180
+  stream: true           # stream tokens so the CLI can show live reasoning/tools
+
+  # Rate-limit / context guards — keep requests under provider token caps and
+  # stop retry loops on 429/413 (e.g. Groq free tier = 8000 tokens/minute):
+  #   max_request_tokens   -> cap prompt + reserved completion per request; the
+  #     client trims old history and truncates tool results to fit, and clamps
+  #     max_tokens so prompt+completion stays under this. 0 disables (use 0 for
+  #     self-hosted vLLM, which has no per-minute cap). Set BELOW the hard limit
+  #     for margin — e.g. 7000 for Groq's 8000 TPM.
+  #   max_tool_result_chars -> truncate each tool result fed back to the model
+  #     (graph builds are huge). 0 disables.
+  #   request_max_retries  -> bound the OpenAI client's automatic retries so a
+  #     rate-limit 429 can't spin in a long back-off loop.
+  max_request_tokens: 7000
+  max_tool_result_chars: 4000
+  request_max_retries: 2
+
+  # SELF-HOSTED engine. To serve DeepSeek, point `model` at a DeepSeek HF repo
+  # id (e.g. "deepseek-ai/DeepSeek-R1-Distill-Qwen-7B") and launch it with
+  # serve.sh on a GPU host. Nothing here loads or downloads a model by itself —
+  # the CLI is only a client and never starts an engine.
+  vllm:
+    model: "Qwen/Qwen2.5-7B-Instruct"   # HF repo id / vLLM --served-model-name
+    # CLIENT connect address (where the CLI reaches vLLM) — this is NOT the
+    # serve.sh bind host. serve.sh binds 0.0.0.0 (listen on all interfaces);
+    # the client must dial a concrete reachable host:
+    #   * same container / host network -> 127.0.0.1
+    #   * separate Docker container      -> the vLLM service name or its
+    #     172.x.x.x address, OR just export SPARKS_BASE_URL=http://HOST:8000
+    host: "127.0.0.1"
+    port: 8000
+    api_key: ""                          # or env SPARKS_API_KEY (preferred)
+
+  # Remote engine (OpenAI-compatible). base_url is a full HTTPS URL (with or
+  # without a trailing /v1). The API key comes from env GROQ_API_KEY first.
+  groq:
+    model: "openai/gpt-oss-20b"          # Groq-hosted model (fast LPU inference)
+    base_url: "https://api.groq.com/openai/v1"
+    api_key: ""   # or env GROQ_API_KEY (preferred)
+
+# -----------------------------------------------------------------------------
+# mcp
+#   The standalone FastMCP tool server (mcp_server.py) is launched separately
+#   and ATTACHED to vLLM via `--tool-server <tool_server_url>` (see serve.sh).
+#   vLLM then invokes these tools server-side during generation.
+# -----------------------------------------------------------------------------
+mcp:
+  host: "0.0.0.0"
+  port: 8001
+  transport: "sse"                          # sse | streamable-http
+  tool_server_url: "http://172.23.0.5:8001/sse"   # what vLLM --tool-server connects to
+  market_data:
+    default_exchange: "NS"   # NS (NSE, *.NS) or BO (BSE, *.BO)
+    use_live: true           # true -> yfinance live fetch; false -> deterministic mock
+    cache_ttl_seconds: 60    # in-process quote cache to avoid hammering the API
+
+# -----------------------------------------------------------------------------
+# newsapi
+#   Stock-news context provider. The `get_stock_news` MCP tool fetches recent
+#   articles relevant to a stock's price from NewsAPI
+#   (https://newsapi.org/v2/everything) and feeds them back to the model as
+#   grounding context. Supply the key here or via env NEWSAPI_KEY (env wins).
+#   When no key is set — or a live fetch fails — the tool degrades to
+#   deterministic mock headlines so the pipeline still works offline.
+# -----------------------------------------------------------------------------
+newsapi:
+  api_key: ""                              # or env NEWSAPI_KEY (preferred)
+  base_url: "https://newsapi.org/v2/everything"
+  page_size: 8                             # max articles returned as context
+  language: "en"
+  sort_by: "publishedAt"                   # relevancy | popularity | publishedAt
+  lookback_days: 7                         # search window (days back from today)
+  use_live: true                           # true -> real NewsAPI; false -> mock
+
+# -----------------------------------------------------------------------------
+# search
+#   Autonomous web search via a self-hosted SearXNG instance. The `web_search`
+#   MCP tool issues GET <base_url>/search?q=<query>&format=json so the model can
+#   look things up when its other tools/context are insufficient. With no
+#   reachable instance (or use_live: false) it degrades to deterministic mock
+#   results so the pipeline still runs offline.
+# -----------------------------------------------------------------------------
+search:
+  base_url: "http://localhost:8080"        # SearXNG host (curl .../search?...&format=json)
+  max_results: 6                           # cap on results fed back as context
+  language: "en"
+  use_live: true                           # true -> hit SearXNG; false -> mock
+  request_timeout: 15
+
+# -----------------------------------------------------------------------------
+# newsdata
+#   Historical news provider for BACKTESTING via newsdata.io (archive endpoint).
+#   The `fetch_news_archive` tool returns date-bounded articles for a query. To
+#   avoid look-ahead past the model's training cutoff, `earliest_date` is a HARD
+#   floor: any from_date before it is clamped up, and to_date before it errors.
+#   Supply the key here or via env NEWSDATA_API_KEY (env wins). Without a key —
+#   or with use_live:false — it returns deterministic mock articles.
+# -----------------------------------------------------------------------------
+newsdata:
+  api_key: ""                              # or env NEWSDATA_API_KEY (preferred)
+  language: "en"
+  earliest_date: "2025-08-05"              # hard floor (LLM training cutoff)
+  max_articles: 8
+  use_live: true                           # true -> newsdata.io archive; false -> mock
+  request_timeout: 20
+
+# -----------------------------------------------------------------------------
+# backtesting
+#   Periodic-rebalancing market simulation that drives the portfolio-generation
+#   flow over a historical window. At each rebalance date it builds point-in-time
+#   analytics + archive news + (optional) knowledge-graph context, lets the LLM
+#   choose weights (deterministic baseline fallback offline), sizes at that
+#   date's prices, and marks the book to market vs a benchmark.
+#   NOTE: web_search is DISABLED during backtesting, and the window start is
+#   clamped to `newsdata.earliest_date` (no look-ahead before the training cutoff).
+# -----------------------------------------------------------------------------
+backtesting:
+  start_date: "2025-08-05"                 # clamped to newsdata.earliest_date floor
+  end_date: ""                             # empty -> today
+  rebalance: "weekly"                     # weekly | monthly | quarterly
+  initial_capital: 1000000                 # INR
+  benchmark: "^NSEI"                       # NIFTY 50
+  sectors: ["banking"]
+  risk_profile: "balanced"                 # conservative | balanced | aggressive
+  lookback_days: 126                       # trailing window for as-of analytics (~6mo)
+  news_lookback_days: 14                   # archive news window before each rebalance
+  use_graph: true                          # feed knowledge-graph context to the LLM
+  use_web_search: false                    # HARD off during backtesting
+  results_dir: "backtesting/results"       # equity curve + report land here
+
+# -----------------------------------------------------------------------------
+# portfolio_graph
+#   POINT-IN-TIME user-portfolio knowledge graph (run_portfolio_graph_asof.py).
+#   Nodes are the portfolio's tickers; features are AS-OF statistical metrics
+#   (return/vol/Sharpe/momentum over a trailing window ending at the chosen past
+#   date) plus newsdata.io ARCHIVE news for [start,end] with a sentiment score.
+#   An LLM then reasons over that snapshot to validate associations. To keep the
+#   historical graph honest, web_search (present-day results) is OFF by default
+#   and the window start is clamped to newsdata.earliest_date.
+# -----------------------------------------------------------------------------
+portfolio_graph:
+  portfolio: "knowledge/portfolios/sample_portfolio.csv"  # default user portfolio
+  start_date: "2025-08-08"                 # window start (>= training cutoff)
+  end_date: ""                             # empty -> start_date + window_days
+  window_days: 30                          # span used when end_date is empty
+  lookback_days: 126                       # trailing window for as-of metrics (~6mo)
+  correlation_threshold: 0.4               # min |as-of correlation| to seed an edge
+  min_validations: 2                       # confirming passes to accept an edge
+  allow_web_search: false                  # present-day results = look-ahead; off
+
+# -----------------------------------------------------------------------------
+# api_credentials
+#   PLACEHOLDERS ONLY. Never commit real secrets. Supply via environment
+#   variables; the loader prefers env vars over file values.
+# -----------------------------------------------------------------------------
+api_credentials:
+  newsapi_key: ""          # deprecated: prefer the `newsapi` section above. Kept
+                           # as a fallback; env NEWSAPI_KEY still wins over both.
+
+# -----------------------------------------------------------------------------
+# storage_paths
+#   The central knowledge/ data layer. Keep these in sync with the on-disk tree.
+# -----------------------------------------------------------------------------
+storage_paths:
+  knowledge_root: "knowledge"
+  portfolios: "knowledge/portfolios"
+  market_data: "knowledge/market_data"
+  vector_db: "knowledge/vector_db"
+  # Persisted sector/portfolio knowledge graphs (one JSON per graph_id), so a
+  # graph built in one session can be queried/visualized in a later one.
+  graphs: "knowledge/market_data/graphs"
+  default_portfolio: "knowledge/portfolios/sample_portfolio.csv"
+
+# -----------------------------------------------------------------------------
+# analysis
+#   Target allocation bands (percent of total value) used to generate
+#   diversification commentary. Illustrative reference bands, NOT advice.
+# -----------------------------------------------------------------------------
+analysis:
+  target_allocation:
+    Equity: 60
+    Bond: 25
+    Cash: 5
+    Commodity: 5
+    "Real Estate": 5
+  drift_tolerance_pct: 10

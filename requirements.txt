@@ -6,9 +6,25 @@ openai>=1.30          # OpenAI-compatible client for the vLLM endpoint
 fastmcp>=2.0          # standalone Indian market-data MCP server (mcp_server.py)
 
 # --- Market data -------------------------------------------------------------
-yfinance>=0.2.40      # live Indian quotes (.NS/.BO); mock fallback if absent
+yfinance>=0.2.40      # live Indian quotes (.NS/.BO) + history for stats/backtest; mock fallback
 
-# --- Local inference engine (serving host only; not needed by the CLI) -------
+# --- Backtesting news (optional; mock fallback if absent) --------------------
+newsdataapi>=0.1.20   # newsdata.io archive news for backtesting (fetch_news_archive)
+
+# --- Remote reasoning model (groq) -------------------------------------------
+# Groq is OpenAI-compatible, so the `openai` client above is all that is needed
+# (no `groq` SDK required). Key via env GROQ_API_KEY or config.yaml.
+
+# --- External services (optional; graceful mock fallback if unavailable) -----
+# * SearXNG   -> the `web_search` tool (self-hosted; see `search.base_url`).
+# * Graphviz  -> the `dot` binary renders graph images for visualize_sector_graph
+#                (brew install graphviz / apt-get install graphviz). Without it,
+#                only the .dot source is written. Neither is a pip package.
+
+# --- Self-hosted inference engine (serving host only; not needed by the CLI) -
+# The only self-hosting path, and how DeepSeek models are served. Requires a
+# CUDA GPU; deliberately left commented out so a CPU-only client install can't
+# drag in the GPU stack.
 # vllm>=0.6.0          # launched via serve.sh with --tool-server
 
 # --- Dev / test --------------------------------------------------------------

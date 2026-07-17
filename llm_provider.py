@@ -2,8 +2,13 @@
 
 Decouples the CLI from the inference backend. Everything downstream depends only
 on :class:`LLMProvider` and the normalized :class:`StreamEvent` stream; the
-concrete backend (vLLM over an OpenAI-compatible API, or an offline mock) is
-selected at runtime from config.
+concrete backend is selected at runtime from config:
+
+  * ``vllm`` — self-hosted vLLM over an OpenAI-compatible API. The only
+    self-hosting path, and how DeepSeek models are served (point
+    ``local_inference_settings.vllm.model`` at a DeepSeek repo id).
+  * ``groq`` — the remote Groq API (OpenAI-compatible).
+  * ``mock`` — an offline stub that runs no model.
 
 Streaming contract
 ------------------
@@ -54,6 +59,10 @@ class StreamEvent:
     name: str = ""                       # tool name (tool_call / tool_result)
     arguments: str = ""                  # raw JSON args (tool_call)
     finish_reason: Optional[str] = None  # set on `done`
+    # On `error`: True for unrecoverable failures (rate limit, request too
+    # large, auth, other 4xx) where retrying the turn would just loop. The CLI
+    # aborts the turn instead of proceeding to the next phase.
+    fatal: bool = False
 
 
 # --------------------------------------------------------------------------- #
@@ -64,8 +73,14 @@ class LLMProvider(abc.ABC):
 
     name: str = "abstract"
     #: True if the engine executes attached tools server-side (e.g. vLLM
-    #: --tool-server). When False, the CLI runs tool-free for this engine.
+    #: --tool-server). Distinct from ``supports_tools``: this only affects
+    #: which executor the CLI wires up (live MCP server vs in-process).
     supports_server_side_tools: bool = False
+    #: True if tool specs should be attached for this provider at all. The
+    #: remote Groq API supports tools but returns the calls to the client, which
+    #: executes them — so this is True while ``supports_server_side_tools`` is
+    #: False.
+    supports_tools: bool = False
 
     @abc.abstractmethod
     def stream_chat(
@@ -81,14 +96,15 @@ class LLMProvider(abc.ABC):
 
 
 # --------------------------------------------------------------------------- #
-# OpenAI-compatible streaming backend (shared by vLLM and Ollama)
+# OpenAI-compatible streaming backend (shared by vLLM and Groq)
 # --------------------------------------------------------------------------- #
 class OpenAICompatibleProvider(LLMProvider):
-    """Streams chat completions from any OpenAI-compatible local engine.
+    """Streams chat completions from any OpenAI-compatible engine.
 
-    Both vLLM and Ollama expose this API at ``http://<host>:<port>/v1``, so the
-    request/stream-parsing logic is identical; subclasses only differ in their
-    label and whether the engine executes tools server-side.
+    Self-hosted vLLM and the remote Groq API both expose this API at
+    ``<base_url>/v1``, so the request/stream-parsing logic is identical;
+    subclasses only differ in their label and whether the engine executes tools
+    server-side.
 
     Tool definitions may be passed via ``tools`` (payload formatting per the
     deliverable). With a server-side tool engine (vLLM ``--tool-server``), tool
@@ -119,9 +135,12 @@ class OpenAICompatibleProvider(LLMProvider):
         )
         return OpenAI(
             base_url=self.settings.openai_base_url,
-            # vLLM requires a non-empty key; Ollama ignores it. "EMPTY" satisfies both.
+            # vLLM requires a non-empty key even when it enforces none.
             api_key=self.settings.api_key or "EMPTY",
             timeout=self.settings.request_timeout,
+            # Bound automatic retries so a rate-limit 429 can't spin in a long
+            # exponential back-off loop (the caller aborts on fatal errors).
+            max_retries=max(0, self.settings.request_max_retries),
         )
 
     def _connection_hint(self, exc: Exception) -> str:
@@ -141,11 +160,33 @@ class OpenAICompatibleProvider(LLMProvider):
         tools: Optional[List[Dict[str, object]]] = None,
     ) -> Iterator[StreamEvent]:
         client = self._client()
+
+        # Guard against oversized requests: truncate large tool results, trim old
+        # history, and clamp the completion budget so prompt + completion stays
+        # under the configured cap (prevents provider 413s / rate-limit loops).
+        max_tokens = self.settings.max_tokens
+        if self.settings.max_request_tokens > 0 or self.settings.max_tool_result_chars > 0:
+            from context_budget import estimate_request_tokens, fit_request
+
+            messages, max_tokens = fit_request(
+                messages,
+                tools,
+                max_request_tokens=self.settings.max_request_tokens,
+                configured_max_tokens=self.settings.max_tokens,
+                max_tool_result_chars=self.settings.max_tool_result_chars,
+            )
+            logger.debug(
+                "Request budget: ~%d prompt tokens, max_tokens=%d (cap=%d)",
+                estimate_request_tokens(messages, tools),
+                max_tokens,
+                self.settings.max_request_tokens,
+            )
+
         kwargs: Dict[str, object] = {
             "model": self.model,
             "messages": messages,
             "temperature": self.settings.temperature,
-            "max_tokens": self.settings.max_tokens,
+            "max_tokens": max_tokens,
             "stream": True,
         }
         if tools:
@@ -162,16 +203,44 @@ class OpenAICompatibleProvider(LLMProvider):
         try:
             stream = client.chat.completions.create(**kwargs)
         except Exception as exc:  # noqa: BLE001
-            # Connection-class failures get an actionable hint; everything else
-            # is surfaced verbatim. Full traceback is logged at debug level.
+            # Classify: connection issues get an actionable hint; rate-limit /
+            # request-too-large / auth (4xx) are FATAL — retrying the turn would
+            # just loop, so the CLI aborts on these. Traceback logged at debug.
             name = type(exc).__name__
+            status = getattr(exc, "status_code", None)
+            low = str(exc).lower()
             is_conn = "Connection" in name or "Timeout" in name or "APIConnection" in name
-            msg = self._connection_hint(exc) if is_conn else (
-                f"{self.engine_label} request failed: {exc}"
+            is_rate_or_size = (
+                status in (413, 429)
+                or "rate_limit" in low
+                or "too large" in low
+                or "tokens per minute" in low
+                or "context length" in low
+                or "maximum context" in low
             )
+            is_client_4xx = isinstance(status, int) and 400 <= status < 500
+
+            if is_conn:
+                msg, fatal = self._connection_hint(exc), False
+            elif is_rate_or_size:
+                msg = (
+                    f"{self.engine_label} rejected the request as too large / "
+                    f"rate-limited ({exc}). The prompt + reserved completion "
+                    "exceeded the model's token-per-minute or context limit. "
+                    "Lower local_inference_settings.max_request_tokens or "
+                    "max_tokens, reduce tool output, or upgrade your API tier. "
+                    "Aborting this turn (not retrying) to avoid a request loop."
+                )
+                fatal = True
+            elif is_client_4xx:
+                msg = f"{self.engine_label} request rejected (HTTP {status}): {exc}"
+                fatal = True
+            else:
+                msg, fatal = f"{self.engine_label} request failed: {exc}", False
+
             logger.error("Chat request failed (%s): %s", name, exc)
             logger.debug("Chat request traceback", exc_info=True)
-            yield StreamEvent(type="error", text=msg)
+            yield StreamEvent(type="error", text=msg, fatal=fatal)
             yield StreamEvent(type="done", finish_reason="error")
             return
 
@@ -232,18 +301,21 @@ class VLLMProvider(OpenAICompatibleProvider):
 
     engine_label = "vllm"
     supports_server_side_tools = True
+    supports_tools = True
 
 
-class OllamaProvider(OpenAICompatibleProvider):
-    """Local Ollama daemon (OpenAI-compatible at /v1).
+class GroqProvider(OpenAICompatibleProvider):
+    """Remote Groq API (OpenAI-compatible, fast LPU inference).
 
-    Ollama has no ``--tool-server`` equivalent, so the MCP tools are not executed
-    server-side; the CLI runs this engine tool-free (it still has the customer
-    portfolio analysis in its system context).
+    Speaks the OpenAI API at ``https://api.groq.com/openai/v1`` and returns
+    tool_calls the CLI executes client-side (in-process), feeding results back.
+    It cannot reach a local ``--tool-server``, so ``supports_server_side_tools``
+    is False.
     """
 
-    engine_label = "ollama"
+    engine_label = "groq"
     supports_server_side_tools = False
+    supports_tools = True
 
 
 # --------------------------------------------------------------------------- #
@@ -261,6 +333,7 @@ class MockStreamingProvider(LLMProvider):
 
     name = "mock:offline"
     supports_server_side_tools = True  # simulates the full tool flow for demos/tests
+    supports_tools = True
 
     _PHASE_MARKERS = ("PLANNING STEP", "ACTING STEP", "ANSWER STEP")
 
@@ -369,7 +442,7 @@ class MockStreamingProvider(LLMProvider):
 # --------------------------------------------------------------------------- #
 _PROVIDERS = {
     "vllm": VLLMProvider,
-    "ollama": OllamaProvider,
+    "groq": GroqProvider,
     "mock": MockStreamingProvider,
 }
 

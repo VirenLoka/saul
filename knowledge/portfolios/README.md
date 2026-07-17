@@ -19,7 +19,14 @@ as `Symbol`, `Qty`, `Value` are also accepted):
 * Tickers are base symbols (no exchange suffix). The MCP market-data tools
   append `.NS` (NSE) or `.BO` (BSE) at fetch time.
 
-`sample_portfolio.csv` holds Indian instruments (equities, a sovereign gold
-bond, liquid/gold ETFs, a REIT, cash) for testing and demos. JSON ingestion can
-be added later as a sibling loader in `portfolio_parser.py` without changing
-call sites.
+Two portfolios are tracked for testing and demos:
+
+* `sample_portfolio.csv` — a diversified Indian book (equities across sectors, a
+  sovereign gold bond, liquid/gold ETFs, a REIT, cash).
+* `banking_portfolio.csv` — an n-ticker book focused purely on the **Indian
+  banking sector** (HDFC/ICICI/SBI/Kotak/Axis/IndusInd/BoB/PNB/IDFC First/
+  Federal/AU/Canara). Feed it to `build_portfolio_graph` to autonomously build
+  and reason over a banking knowledge graph.
+
+JSON ingestion can be added later as a sibling loader in `portfolio_parser.py`
+without changing call sites.

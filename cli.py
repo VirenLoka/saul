@@ -1,8 +1,8 @@
 """Interactive CLI for the MCP-powered Financial Advisor AI Agent.
 
-Runs a conversational loop against the configured local LLM engine (vLLM, with
-the Indian-market MCP tools attached server-side via ``--tool-server``; or
-Ollama tool-free; or the offline mock). It:
+Runs a conversational loop against the configured LLM engine (self-hosted vLLM,
+with the Indian-market MCP tools attached server-side via ``--tool-server``; the
+remote Groq API, which runs those tools client-side; or the offline mock). It:
 
   * maintains conversational memory (system / user / assistant / tool messages
     in a single array, resent each turn),
@@ -36,14 +36,21 @@ from __future__ import annotations
 import argparse
 import logging
 import os
+import shutil
 import sys
 from typing import Dict, List, Optional, TextIO
 
 from analysis import analyze_portfolio
 from config_loader import AppConfig, ConfigError, load_config
 from llm_provider import LLMProvider, get_provider
+from graph_agent import PORTFOLIO_GRAPH_TOOL_SPECS
+from graph_viz import GRAPH_VIZ_TOOL_SPECS
 from market_data import TOOL_SPECS
 from news_data import NEWS_TOOL_SPECS
+from portfolio_builder import PORTFOLIO_TOOL_SPECS
+from sector_graph import GRAPH_TOOL_SPECS
+from stock_stats import STATS_TOOL_SPECS
+from web_search import SEARCH_TOOL_SPECS
 from portfolio_parser import PortfolioParseError, load_portfolio
 from prompts import (
     ACT_DIRECTIVE,
@@ -60,8 +67,27 @@ logger = logging.getLogger("saul.cli")
 # Max tool-execution rounds in the ACT phase before forcing the answer.
 MAX_TOOL_ROUNDS = 4
 
+# Cap the tool result echoed to the terminal (the full result still goes to the
+# model, subject to the provider's own request-size guard). Keeps a huge graph
+# payload from flooding the screen.
+MAX_TOOL_RESULT_DISPLAY_CHARS = 1200
+
+# Committed to memory when a turn is aborted after an unrecoverable request
+# failure, so the transcript stays valid and re-sendable.
+_ABORT_NOTE = (
+    "(Turn aborted: the model request failed — see the error above. No answer "
+    "was produced and no trades were executed.)"
+)
+
 # Callable that runs a tool: executor(name, arguments_json) -> result_json_string.
 ToolExecutor = object  # documented alias; both executors are plain callables
+
+
+def _clip(text: str, max_chars: int) -> str:
+    """Shorten ``text`` for terminal display, marking how much was hidden."""
+    if len(text) <= max_chars:
+        return text
+    return text[:max_chars] + f" …[+{len(text) - max_chars} chars]"
 
 
 # --------------------------------------------------------------------------- #
@@ -193,59 +219,126 @@ class ConversationMemory:
 # Rendering
 # --------------------------------------------------------------------------- #
 class Renderer:
-    """Streams events to an output, printing styled section headers as the
-    section changes."""
+    """Streams events with a clear separation of three registers:
+
+    * **Reasoning** (the model's live chain-of-thought) is *ephemeral*: on a TTY
+      it renders to a single, self-updating status line (spinner + the latest
+      thought) that is wiped as soon as durable output arrives — so it never
+      floods or scrolls the transcript. On a non-TTY (pipe/tests) it is
+      suppressed entirely.
+    * **Durable sections** — 🧭 Plan, 🔧 tool calls / 📊 results, 🔍 Reflection —
+      scroll normally, each with its own styled header so they are visually
+      distinct.
+    * The final **💬 Answer** is set off by a rule so it is unmistakable.
+    """
+
+    _SPINNER = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
 
     def __init__(self, out: TextIO, use_color: bool) -> None:
         self.out = out
         self.color = use_color
+        # The live status line needs ANSI + an interactive terminal.
+        self.live = use_color and hasattr(out, "isatty") and out.isatty()
         self._section: Optional[str] = None
+        self._fresh = True          # cursor is at the start of a blank line
+        self._status_on = False     # a reasoning status line is currently drawn
+        self._reason = ""           # accumulated reasoning for the status tail
+        self._spin = 0
 
-    def _w(self, text: str) -> None:
+    # ---- low-level ---------------------------------------------------------
+    def _raw(self, text: str) -> None:
+        if not text:
+            return
         self.out.write(text)
         self.out.flush()
+        self._fresh = text.endswith("\n")
 
-    def _header(self, section: str, label: str, key: str) -> None:
-        if self._section != section:
-            self._section = section
-            self._w("\n" + _style(label, key, self.color) + "\n")
+    def _width(self) -> int:
+        return max(40, shutil.get_terminal_size((80, 24)).columns)
+
+    def _newline_if_needed(self) -> None:
+        if not self._fresh:
+            self._raw("\n")
+
+    # ---- ephemeral reasoning (live status line) ----------------------------
+    def reasoning(self, text: str) -> None:
+        if not self.live or not text:
+            return  # ephemeral by design: shown live on a TTY, suppressed otherwise
+        if not self._status_on:
+            self._newline_if_needed()   # drop below any partial durable line
+            self._status_on = True
+            self._reason = ""
+        self._reason += text
+        self._spin = (self._spin + 1) % len(self._SPINNER)
+        tail = " ".join(self._reason.split())[-(self._width() - 8):]
+        frame = self._SPINNER[self._spin]
+        # \r + clear-line keeps everything on ONE self-updating row.
+        self.out.write(f"\r\033[2K{_STYLE['muted']}{frame} 🧠 {tail}{_RESET}")
+        self.out.flush()
+        self._fresh = False
+
+    def _clear_status(self) -> None:
+        if self._status_on:
+            self.out.write("\r\033[2K")   # wipe the status line, cursor at col 0
+            self.out.flush()
+            self._status_on = False
+            self._reason = ""
+            self._fresh = True
+
+    # ---- durable sections --------------------------------------------------
+    def _sep_into(self, section: str) -> bool:
+        """Wipe any status line and, when entering a NEW section, emit one blank
+        separator line. Returns True if the section changed."""
+        self._clear_status()
+        changed = self._section != section
+        self._section = section
+        if changed:
+            self._newline_if_needed()
+            self._raw("\n")
+        return changed
+
+    def _header(self, section: str, label: str, key: str, rule: bool = False) -> None:
+        if self._sep_into(section):
+            if rule:
+                self._raw(_style("─" * min(self._width(), 60), "rule", self.color) + "\n")
+            self._raw(_style(label, key, self.color) + "\n")
 
     def plan(self, text: str) -> None:
         self._header("plan", "🧭 Plan", "plan_hdr")
-        self._w(_style(text, "plan", self.color))
-
-    def reasoning(self, text: str) -> None:
-        self._header("reasoning", "🧠 Reasoning", "muted")
-        self._w(_style(text, "muted", self.color))
+        self._raw(_style(text, "plan", self.color))
 
     def working(self, text: str) -> None:
         if not text.strip():
             return
         self._header("working", "⚙️  Working", "muted")
-        self._w(_style(text, "muted", self.color))
+        self._raw(_style(text, "muted", self.color))
 
     def tool_call(self, name: str, arguments: str) -> None:
-        self._section = "tool"  # always break onto its own line
+        self._sep_into("tool")
         line = f"🔧 Invoking MCP tool: {name}({arguments})"
-        self._w("\n" + _style(line, "tool", self.color) + "\n")
+        self._raw(_style(line, "tool", self.color) + "\n")
 
     def tool_result(self, name: str, text: str) -> None:
-        self._section = "tool"
-        self._w(_style(f"📊 Tool result [{name}]: {text}", "result", self.color) + "\n")
+        self._sep_into("tool")  # same section as the call -> no extra blank line
+        self._raw(_style(f"📊 Tool result [{name}]: {text}", "result", self.color) + "\n")
 
     def reflection(self, text: str) -> None:
         self._header("reflection", "🔍 Reflection", "reflect_hdr")
-        self._w(_style(text, "reflect", self.color))
+        self._raw(_style(text, "reflect", self.color))
 
     def answer(self, text: str) -> None:
-        self._header("answer", "💬 Answer", "answer_hdr")
-        self._w(_style(text, "answer", self.color))
+        self._header("answer", "💬 Answer", "answer_hdr", rule=True)
+        self._raw(_style(text, "answer", self.color))
 
     def error(self, text: str) -> None:
-        self._w("\n" + _style(f"⚠️  {text}", "error", self.color) + "\n")
+        self._clear_status()
+        self._newline_if_needed()
+        self._raw(_style(f"⚠️  {text}", "error", self.color) + "\n")
 
     def end_turn(self) -> None:
-        self._w("\n")
+        self._clear_status()
+        self._newline_if_needed()
+        self._raw("\n")
         self._section = None
 
 
@@ -306,13 +399,14 @@ def _stream_phase(
     tools: Optional[List[Dict[str, object]]],
     renderer: Renderer,
     kind: str,
-) -> tuple[List[Dict[str, str]], str, bool]:
+) -> tuple[List[Dict[str, str]], str, bool, bool]:
     """Stream one model response. ``kind`` selects how content is rendered:
     'plan' -> Plan section, 'act' -> Working section. Returns
-    (tool_calls, content_text, had_error)."""
+    (tool_calls, content_text, had_error, fatal)."""
     calls: List[Dict[str, str]] = []
     parts: List[str] = []
     had_error = False
+    fatal = False
     for event in provider.stream_chat(messages, tools=tools):
         if event.type == "reasoning":
             renderer.reasoning(event.text)
@@ -328,23 +422,25 @@ def _stream_phase(
                 renderer.working(event.text)
         elif event.type == "error":
             had_error = True
+            fatal = fatal or event.fatal
             logger.error("Stream error: %s", event.text)
             renderer.error(event.text)
         elif event.type == "done":
             break
-    return calls, "".join(parts), had_error
+    return calls, "".join(parts), had_error, fatal
 
 
 def _stream_answer(
     provider: LLMProvider,
     messages: List[Dict[str, object]],
     renderer: Renderer,
-) -> str:
+) -> tuple[str, bool]:
     """Stream the final phase, splitting REFLECTION from the ANSWER on the
-    ``ANSWER:`` marker. Returns the final user-facing answer text."""
+    ``ANSWER:`` marker. Returns (answer_text, had_error)."""
     splitter = _MarkerSplitter(ANSWER_MARKER)
     reflection_parts: List[str] = []
     answer_parts: List[str] = []
+    had_error = False
 
     def _route(segments: List[tuple[str, str]]) -> None:
         for section, text in segments:
@@ -361,6 +457,8 @@ def _stream_answer(
         elif event.type == "content":
             _route(splitter.feed(event.text))
         elif event.type == "error":
+            had_error = True
+            logger.error("Stream error: %s", event.text)
             renderer.error(event.text)
         elif event.type == "done":
             break
@@ -369,7 +467,7 @@ def _stream_answer(
     answer = "".join(answer_parts).strip()
     if not answer:  # model omitted the ANSWER: marker -> treat all of it as the answer
         answer = "".join(reflection_parts).strip()
-    return answer
+    return answer, had_error
 
 
 # --------------------------------------------------------------------------- #
@@ -399,25 +497,48 @@ def run_turn(
 
     can_use_tools = tools is not None and executor is not None
     working: List[Dict[str, object]] = list(memory.messages)
+    committed_calls: List[Dict[str, str]] = []
+    committed_results: List[Dict[str, str]] = []
+
+    def _commit_and_return(answer_text: str) -> str:
+        """Flush gathered tool calls/results + the answer to long-term memory."""
+        if committed_calls:
+            memory.append_tool_calls(committed_calls)
+            for r in committed_results:
+                memory.append_tool_result(r["id"], r["name"], r["content"])
+        memory.append_assistant_text(answer_text)
+        logger.debug(
+            "Turn complete | tool_calls=%d answer chars=%d",
+            len(committed_calls), len(answer_text),
+        )
+        return answer_text
 
     # ---- PHASE 1: PLAN (no tools) -----------------------------------------
-    _, plan_text, _ = _stream_phase(
+    _, plan_text, _plan_err, plan_fatal = _stream_phase(
         provider, working + [{"role": "user", "content": PLAN_DIRECTIVE}],
         None, renderer, "plan",
     )
+    if plan_fatal:
+        # An oversized/rate-limited request will only recur on the next phase —
+        # abort now rather than looping through ACT and ANSWER.
+        renderer.end_turn()
+        logger.warning("Aborting turn after fatal error in PLAN phase.")
+        return _commit_and_return(_ABORT_NOTE)
     if plan_text.strip():
         working.append({"role": "user", "content": PLAN_DIRECTIVE})
         working.append({"role": "assistant", "content": plan_text})
 
     # ---- PHASE 2: ACT (tool loop) -----------------------------------------
-    committed_calls: List[Dict[str, str]] = []
-    committed_results: List[Dict[str, str]] = []
     if can_use_tools:
         working.append({"role": "user", "content": ACT_DIRECTIVE})
         for round_i in range(max_tool_rounds):
-            calls, _act_text, had_error = _stream_phase(
+            calls, _act_text, had_error, act_fatal = _stream_phase(
                 provider, working, tools, renderer, "act"
             )
+            if act_fatal:
+                renderer.end_turn()
+                logger.warning("Aborting turn after fatal error in ACT phase.")
+                return _commit_and_return(_ABORT_NOTE)
             if had_error or not calls:
                 break
             norm: List[Dict[str, str]] = [
@@ -441,7 +562,7 @@ def run_turn(
             committed_calls.extend(norm)
             for c in norm:
                 result = executor(c["name"], c["arguments"])  # type: ignore[operator]
-                renderer.tool_result(c["name"], result)
+                renderer.tool_result(c["name"], _clip(result, MAX_TOOL_RESULT_DISPLAY_CHARS))
                 working.append(
                     {"role": "tool", "tool_call_id": c["id"], "name": c["name"], "content": result}
                 )
@@ -450,22 +571,13 @@ def run_turn(
             logger.warning("Reached max tool rounds (%d); forcing answer.", max_tool_rounds)
 
     # ---- PHASE 3: REFLECT + ANSWER (no tools) -----------------------------
-    answer = _stream_answer(
+    answer, _ans_err = _stream_answer(
         provider, working + [{"role": "user", "content": ANSWER_DIRECTIVE}], renderer
     )
     renderer.end_turn()
-
-    # ---- COMMIT to long-term memory (valid + minimal) ---------------------
-    if committed_calls:
-        memory.append_tool_calls(committed_calls)
-        for r in committed_results:
-            memory.append_tool_result(r["id"], r["name"], r["content"])
-    memory.append_assistant_text(answer)
-    logger.debug(
-        "Turn complete | tool_calls=%d answer chars=%d",
-        len(committed_calls), len(answer),
-    )
-    return answer
+    if not answer:  # streaming failed (e.g. rate limit) -> commit a clear note
+        answer = _ABORT_NOTE
+    return _commit_and_return(answer)
 
 
 # --------------------------------------------------------------------------- #
@@ -542,8 +654,9 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     p.add_argument("--config", default=None, help="Path to config.yaml.")
     p.add_argument("--portfolio", default=None, help="Portfolio CSV (default from config).")
     p.add_argument("--no-portfolio", action="store_true", help="Skip portfolio context.")
-    p.add_argument("--provider", choices=["vllm", "ollama", "mock"], default=None,
-                   help="Override model_selection.provider.")
+    p.add_argument("--provider",
+                   choices=["vllm", "groq", "mock"],
+                   default=None, help="Override model_selection.provider.")
     p.add_argument("--once", default=None, metavar="TEXT",
                    help="Run a single turn with TEXT, print the answer, and exit.")
     p.add_argument("--no-color", action="store_true", help="Disable ANSI colors.")
@@ -591,25 +704,45 @@ def main(argv: Optional[List[str]] = None, out: Optional[TextIO] = None) -> int:
     provider = get_provider(config)
     memory = ConversationMemory(system_prompt)
 
-    # Attach MCP tools for tool-capable engines (vLLM, mock). Ollama runs
-    # tool-free. The CLI executes tool calls itself (agentic loop):
-    #   * vllm -> call the live FastMCP server over MCP
-    #   * mock -> run the market_data functions in-process (offline, deterministic)
-    tools = (TOOL_SPECS + NEWS_TOOL_SPECS) if provider.supports_server_side_tools else None
+    # Attach the full tool suite for tool-capable engines. The CLI executes tool
+    # calls itself (agentic loop); the executor differs by engine:
+    #   * vllm  -> call the live FastMCP server over MCP
+    #   * groq  -> run tools in-process against live data (a remote API cannot
+    #              reach a local --tool-server)
+    #   * mock  -> run tools in-process, offline/deterministic
+    tools = (
+        (TOOL_SPECS + NEWS_TOOL_SPECS + STATS_TOOL_SPECS + GRAPH_TOOL_SPECS
+         + SEARCH_TOOL_SPECS + GRAPH_VIZ_TOOL_SPECS + PORTFOLIO_GRAPH_TOOL_SPECS
+         + PORTFOLIO_TOOL_SPECS)
+        if provider.supports_tools
+        else None
+    )
     executor: Optional[object] = None
     if tools:
         tool_names = ", ".join(t["function"]["name"] for t in tools)
-        if config.model_selection.provider == "mock":
-            executor = InProcessToolExecutor.from_settings(
-                config.mcp.market_data, use_live=False, newsapi=config.newsapi
-            )
-            tools_line = f"{tool_names} (in-process / offline)"
-        else:
+        provider_name = config.model_selection.provider
+        if provider.supports_server_side_tools and provider_name != "mock":
+            # vLLM: tools executed against the live FastMCP server over MCP.
             executor = MCPToolExecutor(
                 config.mcp.tool_server_url,
                 timeout=config.local_inference.request_timeout,
             )
             tools_line = f"{tool_names} (via MCP @ {config.mcp.tool_server_url})"
+        else:
+            # mock -> deterministic offline; remote APIs -> in-process live data.
+            use_live = provider_name != "mock"
+            executor = InProcessToolExecutor.from_settings(
+                config.mcp.market_data,
+                use_live=use_live,
+                newsapi=config.newsapi,
+                search=config.search,
+                graphs_dir=config.storage_paths.graphs,
+                portfolios_dir=config.storage_paths.portfolios,
+                newsdata=config.newsdata,
+                default_portfolio=(portfolio_path or config.storage_paths.default_portfolio),
+            )
+            where = "offline" if provider_name == "mock" else f"in-process, live · {provider_name}"
+            tools_line = f"{tool_names} ({where})"
     else:
         tools_line = "disabled for this engine (runs tool-free)"
 

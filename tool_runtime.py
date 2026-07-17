@@ -22,7 +22,12 @@ import logging
 from typing import TYPE_CHECKING, Union
 
 if TYPE_CHECKING:
-    from config_loader import MarketDataSettings, NewsApiSettings
+    from config_loader import (
+        MarketDataSettings,
+        NewsApiSettings,
+        NewsDataSettings,
+        SearchSettings,
+    )
 
 logger = logging.getLogger("saul.tools")
 
@@ -135,11 +140,24 @@ class InProcessToolExecutor:
         use_live: bool = False,
         cache_ttl_seconds: int = 60,
         newsapi: "NewsApiSettings | None" = None,
+        search: "SearchSettings | None" = None,
+        graphs_dir: str | None = None,
+        portfolios_dir: str | None = None,
+        newsdata: "NewsDataSettings | None" = None,
     ) -> None:
         self.default_exchange = default_exchange
         self.use_live = use_live
         self.cache_ttl_seconds = cache_ttl_seconds
         self.newsapi = newsapi
+        self.search = search
+        self.newsdata = newsdata
+        self.default_portfolio: str | None = None
+        self.graphs_dir = graphs_dir
+        self.portfolios_dir = portfolios_dir
+        if graphs_dir:
+            from sector_graph import set_graphs_dir
+
+            set_graphs_dir(graphs_dir)
 
     @classmethod
     def from_settings(
@@ -148,13 +166,24 @@ class InProcessToolExecutor:
         *,
         use_live: bool | None = None,
         newsapi: "NewsApiSettings | None" = None,
+        search: "SearchSettings | None" = None,
+        graphs_dir: str | None = None,
+        portfolios_dir: str | None = None,
+        default_portfolio: str | None = None,
+        newsdata: "NewsDataSettings | None" = None,
     ) -> "InProcessToolExecutor":
-        return cls(
+        ex = cls(
             default_exchange=md.default_exchange,
             use_live=md.use_live if use_live is None else use_live,
             cache_ttl_seconds=md.cache_ttl_seconds,
             newsapi=newsapi,
+            search=search,
+            graphs_dir=graphs_dir,
+            portfolios_dir=portfolios_dir,
+            newsdata=newsdata,
         )
+        ex.default_portfolio = default_portfolio
+        return ex
 
     def __call__(self, name: str, arguments: ArgsType) -> str:
         from market_data import (  # local import keeps module deps light
@@ -162,7 +191,14 @@ class InProcessToolExecutor:
             get_sector_performance,
             get_stock_quote,
         )
+        from backtesting.news_archive import NewsArchiveError
+        from graph_viz import GraphVizError
         from news_data import NewsDataError, get_stock_news
+        from portfolio_builder import PortfolioBuildError
+        from portfolio_parser import PortfolioParseError
+        from sector_graph import GraphError
+        from stock_stats import StatsError
+        from web_search import WebSearchError
 
         try:
             args = parse_args(arguments)
@@ -200,8 +236,200 @@ class InProcessToolExecutor:
                     # unless live is explicitly enabled on both.
                     use_live=self.use_live and (ns.use_live if ns else True),
                 )
+            elif name in _STATS_TOOLS:
+                result = self._call_stats(name, args)
+            elif name in _GRAPH_TOOLS:
+                result = self._call_graph(name, args)
+            elif name == "web_search":
+                result = self._call_search(args)
+            elif name == "fetch_news_archive":
+                result = self._call_news_archive(args)
+            elif name in _PORTFOLIO_TOOLS:
+                result = self._call_portfolio(name, args)
             else:
                 return _err(f"unknown tool '{name}'")
             return json.dumps(result)
-        except (MarketDataError, NewsDataError) as exc:
+        except (
+            MarketDataError, NewsDataError, StatsError, GraphError,
+            GraphVizError, WebSearchError, PortfolioBuildError,
+            PortfolioParseError, FileNotFoundError, NewsArchiveError,
+        ) as exc:
             return _err(str(exc))
+
+    def _call_news_archive(self, args: dict) -> dict:
+        from backtesting.news_archive import fetch_news_archive
+
+        nd = self.newsdata
+        return fetch_news_archive(
+            args.get("query", ""),
+            args.get("from_date", ""),
+            args.get("to_date", ""),
+            api_key=nd.api_key if nd else "",
+            language=nd.language if nd else "en",
+            earliest_date=nd.earliest_date if nd else "2025-08-05",
+            max_articles=int(args.get("max_articles") or (nd.max_articles if nd else 8)),
+            use_live=self.use_live and (nd.use_live if nd else True),
+        )
+
+    def _call_portfolio(self, name: str, args: dict) -> dict:
+        exchange = args.get("exchange") or self.default_exchange
+        if name == "fetch_sector_analytics":
+            from portfolio_builder import fetch_sector_analytics
+
+            return fetch_sector_analytics(
+                args.get("sectors") or [], exchange, use_live=self.use_live
+            )
+        # generate_final_portfolio
+        from portfolio_builder import generate_final_portfolio
+
+        return generate_final_portfolio(
+            args.get("ticker_weights") or {},
+            float(args.get("total_amount") or 0.0),
+            exchange=exchange,
+            reasoning=args.get("reasoning") or "",
+            use_live=self.use_live,
+            output_dir=self.portfolios_dir,
+        )
+
+    def _call_search(self, args: dict) -> dict:
+        from web_search import web_search
+
+        se = self.search
+        return web_search(
+            args.get("query", ""),
+            base_url=se.base_url if se else "http://localhost:8080",
+            max_results=int(args.get("max_results") or (se.max_results if se else 6)),
+            language=se.language if se else "en",
+            # in-process executor backs the offline mock provider by default;
+            # honour the search config's live flag when present.
+            use_live=self.use_live and (se.use_live if se else True),
+            request_timeout=se.request_timeout if se else 15.0,
+        )
+
+    def _call_stats(self, name: str, args: dict) -> dict:
+        from stock_stats import (
+            get_correlation_matrix,
+            get_fundamentals,
+            get_return_statistics,
+            get_risk_metrics,
+            get_technical_indicators,
+        )
+
+        exchange = args.get("exchange") or self.default_exchange
+        period = int(args.get("period_days") or 252)
+        if name == "get_return_statistics":
+            return get_return_statistics(
+                args.get("query", ""), exchange,
+                period_days=period, use_live=self.use_live,
+            )
+        if name == "get_technical_indicators":
+            return get_technical_indicators(
+                args.get("query", ""), exchange,
+                period_days=period, use_live=self.use_live,
+            )
+        if name == "get_risk_metrics":
+            return get_risk_metrics(
+                args.get("query", ""), exchange,
+                benchmark=args.get("benchmark") or "^NSEI",
+                period_days=period, use_live=self.use_live,
+            )
+        if name == "get_correlation_matrix":
+            return get_correlation_matrix(
+                args.get("queries") or [], exchange,
+                period_days=period, use_live=self.use_live,
+            )
+        # get_stock_fundamentals
+        return get_fundamentals(args.get("query", ""), exchange, use_live=self.use_live)
+
+    def _call_graph(self, name: str, args: dict) -> dict:
+        from sector_graph import (
+            NewsSentimentProvider,
+            build_sector_graph,
+            get_all_graphs,
+            get_sector_graph,
+            list_graphs,
+            propose_graph_edge,
+            validate_graph_edge,
+        )
+
+        if name == "build_sector_graph":
+            return build_sector_graph(
+                args.get("sectors") or [],
+                args.get("exchange") or self.default_exchange,
+                period_days=int(args.get("period_days") or 252),
+                correlation_threshold=float(args.get("correlation_threshold") or 0.4),
+                use_live=self.use_live,
+                sentiment_provider=NewsSentimentProvider(self.newsapi),
+            )
+        if name == "propose_graph_edge":
+            return propose_graph_edge(
+                args.get("graph_id", ""), args.get("source", ""),
+                args.get("target", ""), args.get("relation", ""),
+                args.get("rationale", ""), float(args.get("weight") or 0.0),
+            )
+        if name == "validate_graph_edge":
+            return validate_graph_edge(
+                args.get("graph_id", ""), args.get("source", ""),
+                args.get("target", ""), args.get("relation", ""),
+                args.get("verdict", ""), args.get("reasoning", ""),
+            )
+        if name == "list_saved_graphs":
+            return {"graphs": list_graphs()}
+        if name == "get_all_graphs":
+            return get_all_graphs(
+                include_features=bool(args.get("include_features", False)),
+                status=args.get("status", ""),
+                ticker=args.get("ticker", ""),
+                sector=args.get("sector", ""),
+            )
+        if name == "build_portfolio_graph":
+            from graph_agent import build_portfolio_graph
+
+            # In-process tool exec uses the deterministic heuristic (no nested
+            # LLM); the model can still refine edges afterwards.
+            return build_portfolio_graph(
+                args.get("portfolio_path") or self.default_portfolio
+                or "knowledge/portfolios/sample_portfolio.csv",
+                args.get("exchange") or self.default_exchange,
+                min_validations=int(args.get("min_validations") or 2),
+                use_live=self.use_live,
+                sentiment_provider=NewsSentimentProvider(self.newsapi),
+            )
+        if name == "visualize_sector_graph":
+            from graph_viz import visualize_sector_graph
+
+            kwargs = {"image_format": args.get("image_format") or "svg"}
+            if self.graphs_dir:
+                kwargs["out_dir"] = self.graphs_dir
+            return visualize_sector_graph(args.get("graph_id", ""), **kwargs)
+        # get_sector_graph
+        return get_sector_graph(
+            args.get("graph_id", ""),
+            include_features=bool(args.get("include_features", False)),
+            status=args.get("status", ""),
+        )
+
+
+_STATS_TOOLS = {
+    "get_return_statistics",
+    "get_technical_indicators",
+    "get_risk_metrics",
+    "get_correlation_matrix",
+    "get_stock_fundamentals",
+}
+
+_GRAPH_TOOLS = {
+    "build_sector_graph",
+    "propose_graph_edge",
+    "validate_graph_edge",
+    "get_sector_graph",
+    "list_saved_graphs",
+    "get_all_graphs",
+    "build_portfolio_graph",
+    "visualize_sector_graph",
+}
+
+_PORTFOLIO_TOOLS = {
+    "fetch_sector_analytics",
+    "generate_final_portfolio",
+}

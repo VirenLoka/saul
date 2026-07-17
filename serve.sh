@@ -1,38 +1,31 @@
 #!/usr/bin/env bash
 # =============================================================================
-# Launch the local LLM engine for the Financial Advisor agent.
+# Launch the self-hosted vLLM engine for the Financial Advisor agent.
 #
-# Choose the engine with SPARKS_ENGINE (default: vllm):
-#   SPARKS_ENGINE=vllm    bash serve.sh   # vLLM + server-side MCP tools (--tool-server)
-#   SPARKS_ENGINE=ollama  bash serve.sh   # Ollama daemon (OpenAI-compatible at /v1)
+# vLLM is the ONLY self-hosting path (Ollama support was removed). It is also
+# how DeepSeek models are served: point SPARKS_MODEL (or config.yaml's
+# local_inference_settings.vllm.model) at a DeepSeek HF repo id, e.g.
+#   SPARKS_MODEL=deepseek-ai/DeepSeek-R1-Distill-Qwen-7B bash serve.sh
 #
-# Keep config.yaml's model_selection.provider in sync with SPARKS_ENGINE.
+# Keep config.yaml's model_selection.provider: vllm in sync with this script.
 #
-# vLLM mode (full MCP tool calling):
+# REQUIRES A CUDA GPU. This script loads model weights and will fail on a
+# CPU-only host — run it on the serving box, not a laptop.
+#
+# Full MCP tool calling:
 #   Start the MCP tool server FIRST, in a separate terminal:
 #       python mcp_server.py          # serves SSE on 127.0.0.1:8001 (per config.yaml)
 #   Then:
 #       export SPARKS_API_KEY="$(openssl rand -hex 32)"
-#       SPARKS_ENGINE=vllm bash serve.sh
+#       bash serve.sh
 #       python cli.py                 # Terminal 3
 #   Prereqs (serving host): pip install "vllm>=0.6.0" fastmcp
 #
-# Ollama mode:
-#   NOTE: Ollama has no --tool-server, so the MCP tools are NOT executed
-#   server-side; the CLI runs tool-free for this engine (it still gets the
-#   portfolio analysis in its system context). The mcp_server is not needed.
-#       SPARKS_ENGINE=ollama bash serve.sh
-#       python cli.py                 # with model_selection.provider: ollama
-#   Prereqs (serving host): install Ollama (https://ollama.com).
-#
 # Variables (mirror config.yaml):
-#   vLLM   : SPARKS_HOST / SPARKS_PORT / SPARKS_MODEL / SPARKS_API_KEY (required)
-#            SPARKS_TOOL_SERVER_URL / SPARKS_MAX_MODEL_LEN / _GPU_UTIL / _TOOL_PARSER
-#   Ollama : OLLAMA_MODEL / OLLAMA_BIND (host:port, default 127.0.0.1:11434)
+#   SPARKS_HOST / SPARKS_PORT / SPARKS_MODEL / SPARKS_API_KEY (required)
+#   SPARKS_TOOL_SERVER_URL / SPARKS_MAX_MODEL_LEN / _GPU_UTIL / _TOOL_PARSER
 # =============================================================================
 set -euo pipefail
-
-ENGINE="${SPARKS_ENGINE:-vllm}"   # vllm | ollama
 
 # --------------------------------------------------------------------------- #
 launch_vllm() {
@@ -60,6 +53,8 @@ launch_vllm() {
 
   # --enable-auto-tool-choice + --tool-call-parser: parse the model's tool calls.
   # --tool-server: connect to the MCP server and execute tools server-side.
+  # NOTE: for a DeepSeek model, set SPARKS_TOOL_PARSER=deepseek_v3 (the hermes
+  # default is for the Qwen2.5 family).
   exec vllm serve "${MODEL}" \
     --host "${HOST}" \
     --port "${PORT}" \
@@ -72,45 +67,9 @@ launch_vllm() {
     --api-key "${SPARKS_API_KEY}"
 }
 
-# --------------------------------------------------------------------------- #
-launch_ollama() {
-  local MODEL BIND
-  MODEL="${OLLAMA_MODEL:-qwen2.5:7b-instruct}"
-  BIND="${OLLAMA_BIND:-127.0.0.1:11434}"
+launch_vllm
 
-  if ! command -v ollama >/dev/null 2>&1; then
-    echo "ERROR: 'ollama' not found. Install it from https://ollama.com" >&2
-    exit 1
-  fi
-
-  echo "Starting Ollama:"
-  echo "  model    : ${MODEL}"
-  echo "  endpoint : http://${BIND}/v1  (OpenAI-compatible)"
-  echo "NOTE: Ollama has no --tool-server; MCP tools are NOT executed server-side."
-  echo "      Set model_selection.provider: ollama in config.yaml."
-
-  # Pull the model if missing (no-op if already present).
-  echo "Pulling ${MODEL} (no-op if already present)..."
-  ollama pull "${MODEL}"
-
-  # If the Ollama background service already holds the port, 'ollama serve' will
-  # exit with 'address already in use' — that's fine, it's already running.
-  echo "Launching daemon on ${BIND} (Ctrl-C to stop)..."
-  exec env OLLAMA_HOST="${BIND}" ollama serve
-}
-
-# --------------------------------------------------------------------------- #
-case "${ENGINE}" in
-  vllm)   launch_vllm ;;
-  ollama) launch_ollama ;;
-  *)
-    echo "ERROR: unknown SPARKS_ENGINE='${ENGINE}'. Use 'vllm' or 'ollama'." >&2
-    exit 1
-    ;;
-esac
-
-# --- One-liner equivalents (copy/paste) -------------------------------------
-# vLLM:
+# --- One-liner equivalent (copy/paste) --------------------------------------
 #   Terminal 1:  python mcp_server.py
 #   Terminal 2:
 #     SPARKS_API_KEY="$(openssl rand -hex 32)" \
@@ -120,8 +79,3 @@ esac
 #       --tool-server http://127.0.0.1:8001/sse \
 #       --api-key "${SPARKS_API_KEY}"
 #   Terminal 3:  SPARKS_API_KEY="<same key>" python cli.py
-#
-# Ollama:
-#   ollama pull qwen2.5:7b-instruct
-#   ollama serve                      # daemon on 127.0.0.1:11434
-#   python cli.py                     # config: model_selection.provider: ollama

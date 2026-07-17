@@ -15,9 +15,9 @@ import yaml
 
 from config_loader import load_config
 from llm_provider import (
+    GroqProvider,
     LLMProviderError,
     MockStreamingProvider,
-    OllamaProvider,
     StreamEvent,
     VLLMProvider,
     get_provider,
@@ -38,8 +38,9 @@ def _with_provider(cfg, provider):
         os.unlink(path)
 
 
-def test_factory_returns_vllm_by_default():
-    cfg = load_config()
+def test_factory_returns_vllm_when_selected():
+    # Pin the provider so the test is independent of the working-copy default.
+    cfg = _with_provider(load_config(), "vllm")
     provider = get_provider(cfg)
     assert isinstance(provider, VLLMProvider)
     assert provider.model == "Qwen/Qwen2.5-7B-Instruct"
@@ -47,14 +48,14 @@ def test_factory_returns_vllm_by_default():
     assert provider.supports_server_side_tools is True
 
 
-def test_factory_returns_ollama_when_selected():
-    cfg = _with_provider(load_config(), "ollama")
+def test_factory_returns_groq_when_selected():
+    cfg = _with_provider(load_config(), "groq")
     provider = get_provider(cfg)
-    assert isinstance(provider, OllamaProvider)
-    assert provider.model == "qwen2.5:7b-instruct"
-    assert "ollama" in provider.describe()
-    # Ollama has no --tool-server, so the CLI runs it tool-free.
+    assert isinstance(provider, GroqProvider)
+    assert "groq" in provider.describe()
+    # A remote API can't reach a local --tool-server; tools run client-side.
     assert provider.supports_server_side_tools is False
+    assert provider.supports_tools is True
 
 
 def test_factory_returns_mock_when_selected():

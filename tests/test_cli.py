@@ -70,7 +70,7 @@ def test_run_turn_updates_memory_with_tool_messages():
 
 
 def test_run_turn_without_executor_skips_tools():
-    """No executor -> no ACT phase; still plans and answers (e.g. Ollama)."""
+    """No executor -> no ACT phase; still plans and answers."""
     out = io.StringIO()
     mem = ConversationMemory("sys")
     run_turn(MockStreamingProvider(), mem, "Quote for Reliance?",
